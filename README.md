@@ -9,7 +9,6 @@ A native Qt window onto the rtorrent that's been running headless in your `scree
 
 `[ View on GitHub ]` `git clone https://github.com/YOURUSERNAME/rtorrent-qt-gui.git`
 
-**[Live demo panel — a table with columns: Name, Status, Progress, Down, Up, ETA, Peers, Ratio, Size, Downloaded, Uploaded — showing sample rows like debian-13.2.0-amd64-netinst.iso (seeding), ubuntu-24.04.3-desktop-amd64.iso (downloading), archlinux-2026.08.01-x86_64.iso (checking), fedora-42-workstation-x86_64.iso (paused), opensuse-tumbleweed-dvd-x86_64.iso (error)]**
 
 Legend: ● seeding ● downloading ● checking ● paused ● error
 
