@@ -194,13 +194,16 @@ def compute_status(t):
         return "Error"
     if t["is_hash_checking"]:
         return "Checking"
-    if not t["state"]:
-        return "Paused"
-    if not t["is_active"]:
-        return "Paused"
-    if t["complete"]:
-        return "Seeding"
-    return "Downloading"
+    # Check active/complete state BEFORE looking at d.message: rtorrent does
+    # not reliably clear that field once a torrent recovers, so a torrent
+    # that's happily seeding or downloading right now can still be carrying
+    # a stale tracker/IO message from hours ago. Only treat it as an error
+    # once we know the torrent isn't actually active.
+    if t["is_active"] and t["state"]:
+        return "Seeding" if t["complete"] else "Downloading"
+    if t["message"]:
+        return "Error"
+    return "Paused"
 
 
 def compute_eta_seconds(t):
@@ -615,7 +618,10 @@ class MainWindow(QMainWindow):
             name_item = QTableWidgetItem(t["name"])
             name_item.setData(Qt.UserRole, t["hash"])
             self.table.setItem(row, 0, name_item)
-            self.table.setItem(row, 1, QTableWidgetItem(status))
+            status_item = QTableWidgetItem(status)
+            if t["message"]:
+                status_item.setToolTip(t["message"])
+            self.table.setItem(row, 1, status_item)
             self.table.setItem(row, 2, NumericItem(f"{progress:.1f}%", progress))
             self.table.setItem(row, 3, NumericItem(human_speed(t["down_rate"]), t["down_rate"]))
             self.table.setItem(row, 4, NumericItem(human_speed(t["up_rate"]), t["up_rate"]))
