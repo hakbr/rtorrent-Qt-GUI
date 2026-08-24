@@ -7,7 +7,7 @@
 
 A native Qt window onto the rtorrent running headless in your `screen` session. **No web UI, no reverse proxy, no ncurses squinting** — it speaks XML-RPC straight over the SSH key you already trust.
 
-`[ View on GitHub ]` `git clone https://github.com/Hallvor/rtorrent-qt-gui.git`
+`[ View on GitHub ]` `git clone https://github.com/hakbt/rtorrent-qt-gui.git`
 
 
 Legend: ● seeding ● downloading ● checking ● paused ● error
@@ -68,4 +68,4 @@ Open **Settings**, point it at your host and socket path, hit **Connect**. Full 
 
 ---
 
-rtorrent-qt-gui · GPL License — github.com/Hallvor/rtorrent-qt-gui
+rtorrent-qt-gui · GPL License — github.com/hakbr/rtorrent-qt-gui
