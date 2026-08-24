@@ -24,6 +24,7 @@ import sys
 import os
 import json
 import socket
+import shlex
 import time
 import subprocess
 import xmlrpc.client as xmlrpclib
@@ -52,6 +53,7 @@ DEFAULT_CONFIG = {
     "local_socket_path": str(Path.home() / ".cache" / "rtorrent-qt-gui" / "tunnel.sock"),
     "local_tcp_port": 15000,
     "poll_interval": 3,
+    "disk_path": "/",  # remote path to report free disk space for
 }
 
 
@@ -156,11 +158,13 @@ FIELDS = [
     "d.down.total=",
     "d.up.total=",
     "d.message=",
+    "d.base_path=",
 ]
 KEYS = [
     "hash", "name", "state", "is_active", "is_hash_checking", "complete",
     "down_rate", "up_rate", "peers_connected", "peers_not_connected",
     "ratio", "size_bytes", "bytes_done", "down_total", "up_total", "message",
+    "base_path",
 ]
 
 
@@ -354,6 +358,133 @@ class ActionWorker(QThread):
             self.error.emit(str(e))
 
 
+class AddMagnetWorker(QThread):
+    finished_ok = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, rpc, magnet_uri, start=True):
+        super().__init__()
+        self.rpc = rpc
+        self.magnet_uri = magnet_uri
+        # NOTE: do not name this self.start — QThread already has a start()
+        # method to launch the thread, and assigning a plain attribute with
+        # that name shadows it, breaking worker.start() with
+        # "TypeError: 'bool' object is not callable".
+        self.autostart = start
+
+    def run(self):
+        try:
+            # load.start adds the torrent and begins downloading immediately;
+            # load.normal adds it stopped so it can be started later.
+            method = "load.start" if self.autostart else "load.normal"
+            self.rpc.call(method, "", self.magnet_uri)
+            self.finished_ok.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class DeleteWorker(QThread):
+    """Erases torrents from rtorrent, and optionally deletes the downloaded
+    files from disk over a plain SSH command (not the RPC tunnel) using the
+    exact path rtorrent itself reports via d.base_path."""
+
+    progress = pyqtSignal(str)
+    finished_ok = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, rpc, cfg, items, delete_files):
+        super().__init__()
+        self.rpc = rpc
+        self.cfg = cfg
+        self.items = items  # list of dicts: hash, name, base_path
+        self.delete_files = delete_files
+
+    def run(self):
+        cfg = self.cfg
+        try:
+            for item in self.items:
+                name = item["name"]
+                base_path = (item.get("base_path") or "").strip()
+
+                if self.delete_files:
+                    if not base_path.startswith("/") or base_path in ("/", ""):
+                        raise RuntimeError(
+                            f"Refusing to delete '{name}': rtorrent did not report a "
+                            f"safe absolute path (got {base_path!r})."
+                        )
+
+                self.progress.emit(f"Removing {name}...")
+                self.rpc.call("d.erase", item["hash"])
+
+                if self.delete_files:
+                    self.progress.emit(f"Deleting files for {name}...")
+                    cmd = [
+                        "ssh",
+                        "-o", "BatchMode=yes",
+                        "-o", "ConnectTimeout=10",
+                        "-o", "StrictHostKeyChecking=accept-new",
+                        "-p", str(cfg["ssh_port"]),
+                        f"{cfg['ssh_user']}@{cfg['ssh_host']}",
+                        f"rm -rf -- {shlex.quote(base_path)}",
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    if result.returncode != 0:
+                        raise RuntimeError(
+                            f"Removed '{name}' from rtorrent, but deleting its files failed: "
+                            f"{result.stderr.strip() or 'unknown error'}"
+                        )
+            self.finished_ok.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class DiskSpaceWorker(QThread):
+    """Reports free/total disk space for a path on the remote server via a
+    plain `df` over SSH. rtorrent's RPC interface doesn't reliably expose
+    this across versions, so a direct shell command is more dependable."""
+
+    # NOTE: pyqtSignal(int, int) would marshal these as a 32-bit signed C
+    # int (max ~2.1 GB), which silently overflows/wraps for any disk with
+    # more than ~2 GB free — exactly the bug that caused wildly wrong
+    # numbers here. `object` preserves Python's arbitrary-precision int.
+    result_ready = pyqtSignal(object, object)  # avail_bytes, total_bytes
+    error = pyqtSignal(str)
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+
+    def run(self):
+        cfg = self.cfg
+        path = (cfg.get("disk_path") or "/").strip() or "/"
+        remote_cmd = f"df -B1 --output=avail,size -- {shlex.quote(path)}"
+        cmd = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-p", str(cfg["ssh_port"]),
+            f"{cfg['ssh_user']}@{cfg['ssh_host']}",
+            remote_cmd,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "df command failed")
+            # df prints a header row even with --output; the data is the
+            # last non-empty line (defensive against unexpected extra lines).
+            lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+            if len(lines) < 2:
+                raise RuntimeError(f"Unexpected df output: {result.stdout!r}")
+            parts = lines[-1].split()
+            if len(parts) < 2:
+                raise RuntimeError(f"Unexpected df data line: {lines[-1]!r}")
+            avail, total = int(parts[0]), int(parts[1])
+            self.result_ready.emit(avail, total)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 # --------------------------------------------------------------------------
 # Settings dialog
 # --------------------------------------------------------------------------
@@ -388,6 +519,9 @@ class SettingsDialog(QDialog):
         self.poll_spin.setValue(cfg["poll_interval"])
         self.poll_spin.setSuffix(" s")
 
+        self.disk_path_edit = QLineEdit(cfg.get("disk_path", "/"))
+        self.disk_path_edit.setPlaceholderText("/ (or a mount point, e.g. /mnt/downloads)")
+
         form = QFormLayout()
         form.addRow("RPC transport:", self.mode_combo)
         form.addRow(QLabel("<b>SSH</b>"))
@@ -401,6 +535,7 @@ class SettingsDialog(QDialog):
         form.addRow("Remote port:", self.remote_port_spin)
         form.addRow(QLabel("<b>Polling</b>"))
         form.addRow("Refresh every:", self.poll_spin)
+        form.addRow("Disk usage path:", self.disk_path_edit)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -427,6 +562,7 @@ class SettingsDialog(QDialog):
         cfg["remote_host"] = self.remote_host_edit.text().strip()
         cfg["remote_port"] = self.remote_port_spin.value()
         cfg["poll_interval"] = self.poll_spin.value()
+        cfg["disk_path"] = self.disk_path_edit.text().strip() or "/"
         return cfg
 
 
@@ -466,8 +602,12 @@ class MainWindow(QMainWindow):
         self.rpc = None
         self.poll_worker = None
         self.action_worker = None
+        self.poll_fail_count = 0
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self.poll_now)
+        self.disk_worker = None
+        self.disk_timer = QTimer()
+        self.disk_timer.timeout.connect(self.poll_disk_space)
 
         self.build_ui()
         self.update_connect_ui(connected=False)
@@ -486,14 +626,36 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.connect_btn)
         top_row.addWidget(settings_btn)
         top_row.addWidget(refresh_btn)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Filter by name...")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self.apply_filter)
+        self.search_edit.setMinimumWidth(220)
+        top_row.addWidget(self.search_edit)
         top_row.addStretch()
         self.conn_label = QLabel("Disconnected")
         top_row.addWidget(self.conn_label)
         layout.addLayout(top_row)
 
+        magnet_row = QHBoxLayout()
+        magnet_label = QLabel("Add magnet:")
+        self.magnet_edit = QLineEdit()
+        self.magnet_edit.setPlaceholderText("magnet:?xt=urn:btih:...")
+        self.magnet_edit.returnPressed.connect(self.add_magnet)
+        add_magnet_btn = QPushButton("Add torrent")
+        add_magnet_btn.clicked.connect(self.add_magnet)
+        magnet_row.addWidget(magnet_label)
+        magnet_row.addWidget(self.magnet_edit)
+        magnet_row.addWidget(add_magnet_btn)
+        layout.addLayout(magnet_row)
+
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        base_col_width = 90
+        self.table.setColumnWidth(0, base_col_width * 2)  # Name: twice the width of the rest
+        for col in range(1, len(COLUMNS)):
+            self.table.setColumnWidth(col, base_col_width)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSortingEnabled(True)
@@ -505,6 +667,9 @@ class MainWindow(QMainWindow):
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        self.disk_space_label = QLabel("Free: \u2013")
+        self.disk_space_label.setContentsMargins(0, 0, 8, 0)
+        self.status_bar.addPermanentWidget(self.disk_space_label)
 
     # ---------------- connection lifecycle ----------------
 
@@ -561,16 +726,59 @@ class MainWindow(QMainWindow):
         else:
             self.rpc = RTorrentRPC("tcp", tcp_host="127.0.0.1", tcp_port=cfg["local_tcp_port"])
 
+        self.tunnel.process.finished.connect(self.on_tunnel_finished)
+        self.poll_fail_count = 0
         self.update_connect_ui(connected=True)
         self.poll_now()
         self.poll_timer.start(cfg["poll_interval"] * 1000)
+        self.poll_disk_space()
+        self.disk_timer.start(max(cfg["poll_interval"], 30) * 1000)
 
-    def disconnect_all(self):
+    def on_tunnel_finished(self, exit_code, exit_status):
+        # Fires when the ssh -N process exits on its own — network change,
+        # laptop sleep, server reboot, or ServerAliveCountMax giving up on a
+        # dead link. Only act on this if we still think we're connected;
+        # a normal disconnect_all() already tore the tunnel down itself.
+        if self.rpc is None:
+            return
+        output = self.tunnel.output_text().strip() if self.tunnel else ""
+        self.handle_connection_lost(
+            "The SSH tunnel exited unexpectedly — the connection appears to have "
+            "been broken at the other end (e.g. a network change, the machine went "
+            "to sleep, or the server rebooted).",
+            output,
+        )
+
+    def handle_connection_lost(self, reason, detail=""):
         self.poll_timer.stop()
+        self.disk_timer.stop()
+        self.disk_space_label.setText("Free: \u2013")
+        self.rpc = None
         if self.tunnel:
             self.tunnel.stop()
         self.tunnel = None
+        self.poll_fail_count = 0
+        self.update_connect_ui(connected=False)
+        self.status_bar.showMessage("Connection lost", 5000)
+        msg = reason
+        if detail:
+            msg += f"\n\nssh output:\n{detail}"
+        msg += "\n\nClick Connect to reconnect."
+        QMessageBox.warning(self, "Connection lost", msg)
+
+    def disconnect_all(self):
+        self.poll_timer.stop()
+        self.disk_timer.stop()
+        self.disk_space_label.setText("Free: \u2013")
+        if self.tunnel:
+            try:
+                self.tunnel.process.finished.disconnect(self.on_tunnel_finished)
+            except TypeError:
+                pass
+            self.tunnel.stop()
+        self.tunnel = None
         self.rpc = None
+        self.poll_fail_count = 0
         self.update_connect_ui(connected=False)
 
     def update_connect_ui(self, connected):
@@ -598,11 +806,46 @@ class MainWindow(QMainWindow):
         self.poll_worker.error.connect(self.on_poll_error)
         self.poll_worker.start()
 
+    def poll_disk_space(self):
+        if not self.tunnel or not self.tunnel.is_running():
+            return
+        self.disk_worker = DiskSpaceWorker(self.cfg)
+        self.disk_worker.result_ready.connect(self.on_disk_space_ready)
+        self.disk_worker.error.connect(self.on_disk_space_error)
+        self.disk_worker.start()
+
+    def on_disk_space_ready(self, avail, total):
+        self.disk_space_label.setText(f"Free: {human_bytes(avail)} / {human_bytes(total)}")
+        self.disk_space_label.setToolTip(f"Queried path: {self.cfg.get('disk_path', '/')}")
+
+    def on_disk_space_error(self, msg):
+        self.disk_space_label.setText("Free: n/a")
+        self.disk_space_label.setToolTip(f"Could not read disk space: {msg}")
+        self.status_bar.showMessage(f"Disk space check failed: {msg}", 5000)
+
     def on_poll_error(self, msg):
+        self.poll_fail_count += 1
         self.status_bar.showMessage(f"Poll error: {msg}", 5000)
+        if self.poll_fail_count >= 3:
+            self.handle_connection_lost(
+                "Lost contact with rtorrent over the tunnel — the connection appears to "
+                "be broken at the other end, even though the ssh process is still "
+                "running locally (e.g. after sleep or a network change).",
+                msg,
+            )
 
     def on_data_ready(self, torrents):
+        self.poll_fail_count = 0
         self.torrents_by_hash = {t["hash"]: t for t in torrents}
+
+        # Row indices shift on every refresh (rows are recreated, and sorting
+        # can reorder them as values change), so remember what was selected
+        # by torrent hash rather than by row position and restore it after
+        # rebuilding — otherwise the highlight silently drifts onto whatever
+        # torrent happens to land in that row next.
+        previously_selected = set(self.selected_hashes())
+
+        self.table.blockSignals(True)
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(torrents))
 
@@ -634,12 +877,32 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 10, NumericItem(human_bytes(t["up_total"]), t["up_total"]))
 
         self.table.setSortingEnabled(True)
+
+        if previously_selected:
+            self.table.clearSelection()
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, 0)
+                if item and item.data(Qt.UserRole) in previously_selected:
+                    self.table.selectRow(row)
+
+        self.table.blockSignals(False)
+
+        self.apply_filter()
+        visible = sum(1 for row in range(self.table.rowCount()) if not self.table.isRowHidden(row))
+        count_text = f"{len(torrents)} torrents" if visible == len(torrents) else f"{visible} of {len(torrents)} torrents"
         self.status_bar.showMessage(
-            f"{len(torrents)} torrents  |  Total: \u2193 {human_speed(total_down)}  "
+            f"{count_text}  |  Total: \u2193 {human_speed(total_down)}  "
             f"\u2191 {human_speed(total_up)}"
         )
 
     # ---------------- actions ----------------
+
+    def apply_filter(self):
+        query = self.search_edit.text().strip().lower()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            name = item.text().lower() if item else ""
+            self.table.setRowHidden(row, bool(query) and query not in name)
 
     def selected_hashes(self):
         rows = {idx.row() for idx in self.table.selectedIndexes()}
@@ -659,17 +922,96 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         start_action = menu.addAction("Start")
         stop_action = menu.addAction("Stop (pause)")
+        menu.addSeparator()
+        erase_action = menu.addAction("Remove from list (keep files)")
+        delete_action = menu.addAction("Remove and delete files...")
         action = menu.exec_(self.table.viewport().mapToGlobal(pos))
         if action == start_action:
             self.run_action("d.start", hashes)
         elif action == stop_action:
             self.run_action("d.stop", hashes)
+        elif action == erase_action:
+            self.erase_torrents(hashes, delete_files=False)
+        elif action == delete_action:
+            self.erase_torrents(hashes, delete_files=True)
 
     def run_action(self, method, hashes):
         self.action_worker = ActionWorker(self.rpc, method, hashes)
         self.action_worker.finished_ok.connect(self.poll_now)
         self.action_worker.error.connect(lambda msg: self.status_bar.showMessage(f"Action failed: {msg}", 5000))
         self.action_worker.start()
+
+    def erase_torrents(self, hashes, delete_files):
+        items = []
+        for h in hashes:
+            t = self.torrents_by_hash.get(h)
+            if not t:
+                continue
+            items.append({"hash": h, "name": t["name"], "base_path": t.get("base_path", "")})
+        if not items:
+            return
+
+        names = "\n".join(f"  \u2022 {i['name']}" for i in items[:10])
+        if len(items) > 10:
+            names += f"\n  ...and {len(items) - 10} more"
+
+        if delete_files:
+            title = "Delete torrents and files?"
+            text = (
+                "This permanently deletes the downloaded files from the server, in "
+                "addition to removing the torrent(s) from rtorrent.\n\n"
+                "This cannot be undone.\n\n"
+                f"{names}"
+            )
+        else:
+            title = "Remove from list?"
+            text = (
+                "This removes the torrent(s) from rtorrent's list. The downloaded "
+                "files stay on disk.\n\n"
+                f"{names}"
+            )
+
+        confirm = QMessageBox.question(
+            self, title, text, QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.delete_worker = DeleteWorker(self.rpc, self.cfg, items, delete_files)
+        self.delete_worker.progress.connect(lambda msg: self.status_bar.showMessage(msg, 3000))
+        self.delete_worker.finished_ok.connect(self.on_delete_done)
+        self.delete_worker.error.connect(self.on_delete_error)
+        self.delete_worker.start()
+
+    def on_delete_done(self):
+        self.status_bar.showMessage("Done", 3000)
+        self.poll_now()
+
+    def on_delete_error(self, msg):
+        self.status_bar.showMessage(f"Delete failed: {msg}", 6000)
+        QMessageBox.warning(self, "Delete failed", msg)
+
+    def add_magnet(self):
+        magnet = self.magnet_edit.text().strip()
+        if not self.rpc:
+            QMessageBox.warning(self, "Not connected", "Connect to the server first.")
+            return
+        if not magnet.startswith("magnet:"):
+            QMessageBox.warning(self, "Invalid magnet link", "Please enter a valid magnet: link.")
+            return
+        self.magnet_add_worker = AddMagnetWorker(self.rpc, magnet, start=True)
+        self.magnet_add_worker.finished_ok.connect(self.on_magnet_added)
+        self.magnet_add_worker.error.connect(self.on_magnet_add_error)
+        self.magnet_add_worker.start()
+
+    def on_magnet_added(self):
+        self.magnet_edit.clear()
+        self.status_bar.showMessage("Torrent added", 4000)
+        self.poll_now()
+
+    def on_magnet_add_error(self, msg):
+        self.status_bar.showMessage(f"Add torrent failed: {msg}", 6000)
+        QMessageBox.warning(self, "Add torrent failed", msg)
 
     def closeEvent(self, event):
         self.disconnect_all()
