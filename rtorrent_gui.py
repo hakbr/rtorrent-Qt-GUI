@@ -355,8 +355,6 @@ def human_speed(n):
 
 
 def compute_status(t):
-    if t["message"]:
-        return "Error"
     if t["is_hash_checking"]:
         return "Checking"
     # Check active/complete state BEFORE looking at d.message: rtorrent does
