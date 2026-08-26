@@ -9,12 +9,12 @@ If you run rtorrent headless inside a `screen` session on a VPS or home server, 
 
 ## Features
 
-- 🔒 Connects over an SSH tunnel using your existing key-based auth (no passwords, no extra open ports)
-- 📊 Live torrent table: name, status, progress, download/upload speed, ETA, peers, ratio, size, totals
-- ▶️ Start / stop torrents via right-click context menu
-- 🔁 Auto-refreshing view with a configurable poll interval
-- ⚙️ Settings dialog for SSH and RPC connection details, saved to a local config file
-- 🧵 Non-blocking UI — polling and actions run on background threads
+- Connects over an SSH tunnel using your existing key-based auth (no passwords, no extra open ports)
+- Live torrent table: name, status, progress, download/upload speed, ETA, peers, ratio, size, totals
+- Start / stop torrents via right-click context menu
+- Auto-refreshing view with a configurable poll interval
+- Settings dialog for SSH and RPC connection details, saved to a local config file
+- Non-blocking UI — polling and actions run on background threads
 
 ## Requirements
 
