@@ -1510,6 +1510,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         start_action = menu.addAction("Start")
         stop_action = menu.addAction("Stop (pause)")
+        rehash_action = menu.addAction("Rehash (recheck data)")
         menu.addSeparator()
         info_action = None
         if len(hashes) == 1:
@@ -1522,6 +1523,8 @@ class MainWindow(QMainWindow):
             self.run_action("d.start", hashes)
         elif action == stop_action:
             self.run_action("d.stop", hashes)
+        elif action == rehash_action:
+            self.rehash_torrents(hashes)
         elif info_action is not None and action == info_action:
             self.open_tracker_peer_dialog(hashes[0])
         elif action == erase_action:
@@ -1556,6 +1559,39 @@ class MainWindow(QMainWindow):
         self.action_worker.finished_ok.connect(self.poll_now)
         self.action_worker.error.connect(lambda msg: self.status_bar.showMessage(f"Action failed: {msg}", 5000))
         self.action_worker.start()
+
+    def rehash_torrents(self, hashes):
+        names = []
+        for h in hashes:
+            t = self.torrents_by_hash.get(h)
+            names.append(t["name"] if t else h)
+        preview = "\n".join(f"  \u2022 {n}" for n in names[:10])
+        if len(names) > 10:
+            preview += f"\n  ...and {len(names) - 10} more"
+        confirm = QMessageBox.question(
+            self,
+            "Rehash torrent(s)?",
+            "This tells rtorrent to recheck the data on disk against the "
+            "torrent's hashes. It can take a while for large torrents and "
+            "the torrent will be marked incomplete until the check finishes.\n\n"
+            f"{preview}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        count = len(hashes)
+        label = "1 torrent" if count == 1 else f"{count} torrents"
+        self.rehash_worker = ActionWorker(self.rpc, "d.check_hash", hashes)
+        self.rehash_worker.finished_ok.connect(
+            lambda: self.status_bar.showMessage(f"Rehash started for {label}.", 5000)
+        )
+        self.rehash_worker.finished_ok.connect(self.poll_now)
+        self.rehash_worker.error.connect(
+            lambda msg: self.status_bar.showMessage(f"Rehash failed: {msg}", 5000)
+        )
+        self.rehash_worker.start()
 
     def erase_torrents(self, hashes, delete_files):
         items = []
