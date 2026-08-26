@@ -20,11 +20,10 @@ If you run rtorrent headless inside a `screen` session on a VPS or home server, 
 
 ## Requirements
 
-- Linux with a desktop environment (tested on Debian/Ubuntu)
+- Linux with a desktop environment (tested on Debian)
 - Python 3
 - `PyQt5`
 - `openssh-client` (the `ssh` binary must be on your `PATH`)
-- Passwordless SSH key auth already set up to your rtorrent server
 - rtorrent configured with an RPC socket (see [Server-side setup](#server-side-setup) below)
 
 ### Install dependencies (Debian/Ubuntu)
