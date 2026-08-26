@@ -1,6 +1,6 @@
 # rtorrent-qt-gui
 
-A lightweight PyQt5 GUI for monitoring and controlling an [rtorrent](https://github.com/rakshasa/rtorrent) instance running inside `screen`/`tmux` on a remote server, reached over your existing passwordless SSH key auth.
+A lightweight PyQt5 GUI for monitoring and controlling an [rtorrent](https://github.com/rakshasa/rtorrent) instance running inside `screen`/`tmux` on a remote server, reached over your existing password or passwordless SSH key auth.
 
 <img width="1794" height="1007" alt="Skärmbild_20260826_094730" src="https://github.com/user-attachments/assets/805fa280-db07-46ff-a55c-198b1cc58c1a" />
 
