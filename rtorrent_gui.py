@@ -39,7 +39,7 @@ from PyQt5.QtWidgets import (
     QMenu, QAction, QStatusBar, QAbstractItemView, QCheckBox, QFileDialog,
     QSystemTrayIcon, QStyle
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QProcess, QProcessEnvironment
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QProcess, QProcessEnvironment, QEvent
 from PyQt5.QtGui import QIcon
 
 # Password auth stores the secret in the OS keychain via the `keyring`
@@ -1015,6 +1015,12 @@ class TrackerPeerDialog(QDialog):
     def on_error(self, msg):
         self.status_label.setText(f"Refresh failed: {msg}")
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Left:
+            self.reject()
+            return
+        super().keyPressEvent(event)
+
     def closeEvent(self, event):
         self.timer.stop()
         event.accept()
@@ -1053,7 +1059,6 @@ class MainWindow(QMainWindow):
         self.set_limit_worker = None
         self.tracker_peer_dialog = None
         self.prev_complete = {}  # hash -> bool, used to detect completions
-        self._quitting = False
 
         self.build_ui()
         self.build_tray_icon()
@@ -1131,6 +1136,7 @@ class MainWindow(QMainWindow):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
         self.table.cellDoubleClicked.connect(self.show_tracker_peer_info)
+        self.table.installEventFilter(self)
         layout.addWidget(self.table)
 
         self.setCentralWidget(central)
@@ -1170,7 +1176,6 @@ class MainWindow(QMainWindow):
                 self.activateWindow()
 
     def quit_app(self):
-        self._quitting = True
         self.close()
 
     # ---------------- connection lifecycle ----------------
@@ -1530,6 +1535,16 @@ class MainWindow(QMainWindow):
             return
         self.open_tracker_peer_dialog(item.data(Qt.UserRole))
 
+    def eventFilter(self, obj, event):
+        if obj is self.table and event.type() == QEvent.KeyPress and event.key() == Qt.Key_Right:
+            row = self.table.currentRow()
+            if row >= 0 and self.rpc:
+                item = self.table.item(row, 0)
+                if item:
+                    self.open_tracker_peer_dialog(item.data(Qt.UserRole))
+                    return True
+        return super().eventFilter(obj, event)
+
     def open_tracker_peer_dialog(self, torrent_hash):
         t = self.torrents_by_hash.get(torrent_hash)
         name = t["name"] if t else torrent_hash
@@ -1643,17 +1658,6 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Add torrent file failed", msg)
 
     def closeEvent(self, event):
-        if not self._quitting and QSystemTrayIcon.isSystemTrayAvailable() and self.tray_icon.isVisible():
-            event.ignore()
-            self.hide()
-            if not self.cfg.get("_tray_hint_shown"):
-                self.tray_icon.showMessage(
-                    "Still running", "rtorrent GUI is now minimized to the tray. "
-                    "Right-click the tray icon to quit.",
-                    QSystemTrayIcon.Information, 5000,
-                )
-                self.cfg["_tray_hint_shown"] = True
-            return
         self.disconnect_all()
         self.tray_icon.hide()
         event.accept()
@@ -1662,7 +1666,6 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
