@@ -1,6 +1,6 @@
 # rtorrent-qt-gui
 
-A lightweight PyQt5 GUI for monitoring and controlling an [rtorrent](https://github.com/rakshasa/rtorrent) instance running inside `screen`/`tmux` on a remote server, reached over your existing password or passwordless SSH key auth.
+A lightweight PyQt6 GUI for monitoring and controlling an [rtorrent](https://github.com/rakshasa/rtorrent) instance running inside `screen`/`tmux` on a remote server, reached over your existing password or passwordless SSH key auth.
 
 <img width="1794" height="1007" alt="Skärmbild_20260826_094730" src="https://github.com/user-attachments/assets/805fa280-db07-46ff-a55c-198b1cc58c1a" />
 
@@ -22,14 +22,14 @@ If you run rtorrent headless inside a `screen` session on a VPS or home server, 
 
 - Linux with a desktop environment (tested on Debian)
 - Python 3
-- `PyQt5`
+- `PyQt6`
 - `openssh-client` (the `ssh` binary must be on your `PATH`)
 - rtorrent configured with an RPC socket (see [Server-side setup](#server-side-setup) below)
 
 ### Install dependencies (Debian/Ubuntu)
 
 ```bash
-sudo apt install python3-pyqt5 openssh-client
+sudo apt install python3-pyqt6 openssh-client
 ```
 
 ## Usage
