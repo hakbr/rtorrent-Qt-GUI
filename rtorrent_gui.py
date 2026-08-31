@@ -2,7 +2,7 @@
 """
 rtorrent-qt-gui
 ===============
-A PyQt5 GUI for monitoring and controlling an rtorrent instance that runs
+A PyQt6 GUI for monitoring and controlling an rtorrent instance that runs
 inside `screen` on a remote server, reached over your existing passwordless
 SSH key auth.
 
@@ -14,7 +14,9 @@ pyrocore, etc. all do the same thing).
 See README.md for the one-time rtorrent.rc change needed on the server.
 
 Dependencies (Debian):
-    sudo apt install python3-pyqt5 openssh-client
+    sudo apt install python3-pyqt6 openssh-client
+    # If your distro's python3-pyqt6 is too old or missing, install via pip
+    # instead: pip install --break-system-packages PyQt6
 
 Run:
     python3 rtorrent_gui.py
@@ -32,15 +34,15 @@ import xmlrpc.client as xmlrpclib
 from datetime import timedelta
 from pathlib import Path
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QMessageBox, QSpinBox, QDialog, QDialogButtonBox, QLabel, QComboBox,
-    QMenu, QAction, QStatusBar, QAbstractItemView, QCheckBox, QFileDialog,
+    QMenu, QStatusBar, QAbstractItemView, QCheckBox, QFileDialog,
     QSystemTrayIcon, QStyle
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QProcess, QProcessEnvironment, QEvent
-from PyQt5.QtGui import QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QProcess, QProcessEnvironment, QEvent
+from PyQt6.QtGui import QIcon, QAction
 
 # Password auth stores the secret in the OS keychain via the `keyring`
 # package when it's available (pip install keyring / apt install
@@ -393,7 +395,7 @@ class SSHTunnel:
     def __init__(self, cfg):
         self.cfg = cfg
         self.process = QProcess()
-        self.process.setProcessChannelMode(QProcess.MergedChannels)
+        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.readyReadStandardOutput.connect(self._on_ready_read)
         self.process.errorOccurred.connect(self._on_error_occurred)
         self._output = bytearray()
@@ -403,11 +405,11 @@ class SSHTunnel:
         self._output += bytes(self.process.readAllStandardOutput())
 
     def _on_error_occurred(self, err):
-        # e.g. QProcess.FailedToStart if the ssh binary isn't on PATH
+        # e.g. QProcess.ProcessError.FailedToStart if the ssh binary isn't on PATH
         names = {
-            QProcess.FailedToStart: "ssh failed to start (is openssh-client installed and on PATH?)",
-            QProcess.Crashed: "ssh process crashed",
-            QProcess.Timedout: "ssh process timed out",
+            QProcess.ProcessError.FailedToStart: "ssh failed to start (is openssh-client installed and on PATH?)",
+            QProcess.ProcessError.Crashed: "ssh process crashed",
+            QProcess.ProcessError.Timedout: "ssh process timed out",
         }
         msg = names.get(err, f"ssh process error ({err})")
         self._output += (msg + "\n").encode()
@@ -454,14 +456,14 @@ class SSHTunnel:
         self.process.start(program, full_args)
 
     def stop(self):
-        if self.process.state() != QProcess.NotRunning:
+        if self.process.state() != QProcess.ProcessState.NotRunning:
             self.process.terminate()
             if not self.process.waitForFinished(3000):
                 self.process.kill()
                 self.process.waitForFinished(1000)
 
     def is_running(self):
-        return self.process.state() != QProcess.NotRunning
+        return self.process.state() != QProcess.ProcessState.NotRunning
 
     def output_text(self):
         return self._output.decode(errors="replace")
@@ -473,7 +475,7 @@ class SSHTunnel:
         deadline = time.time() + timeout
         while time.time() < deadline:
             QApplication.processEvents()
-            if self.process.state() == QProcess.NotRunning:
+            if self.process.state() == QProcess.ProcessState.NotRunning:
                 return False
             try:
                 if cfg["mode"] == "unix":
@@ -776,7 +778,7 @@ class SettingsDialog(QDialog):
         self.auth_combo.currentIndexChanged.connect(self.update_auth_fields)
 
         self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         has_saved = bool(cfg.get("ssh_password_saved"))
         if has_saved:
             self.password_edit.setPlaceholderText("Saved — leave blank to keep it")
@@ -784,7 +786,7 @@ class SettingsDialog(QDialog):
             self.password_edit.setPlaceholderText("Enter password")
         self.show_password_check = QCheckBox("Show")
         self.show_password_check.toggled.connect(
-            lambda on: self.password_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
+            lambda on: self.password_edit.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
         )
         self.forget_password_btn = QPushButton("Forget saved password")
         self.forget_password_btn.setEnabled(has_saved)
@@ -856,7 +858,7 @@ class SettingsDialog(QDialog):
         form.addRow(QLabel("<b>New torrents</b>"))
         form.addRow("Default download dir:", self.download_dir_edit)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
@@ -957,25 +959,25 @@ class TrackerPeerDialog(QDialog):
         layout.addWidget(QLabel("<b>Trackers</b>"))
         self.tracker_table = QTableWidget(0, len(TRACKER_COLUMNS))
         self.tracker_table.setHorizontalHeaderLabels(TRACKER_COLUMNS)
-        self.tracker_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.tracker_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.tracker_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tracker_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tracker_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tracker_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         layout.addWidget(self.tracker_table, 1)
 
         layout.addWidget(QLabel("<b>Peers</b>"))
         self.peer_table = QTableWidget(0, len(PEER_COLUMNS))
         self.peer_table.setHorizontalHeaderLabels(PEER_COLUMNS)
-        self.peer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.peer_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.peer_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.peer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.peer_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.peer_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         layout.addWidget(self.peer_table, 2)
 
         self.status_label = QLabel("")
         layout.addWidget(self.status_label)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
-        buttons.button(QDialogButtonBox.Close).clicked.connect(self.accept)
+        buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.accept)
         layout.addWidget(buttons)
 
         self.timer = QTimer(self)
@@ -1016,7 +1018,7 @@ class TrackerPeerDialog(QDialog):
         self.status_label.setText(f"Refresh failed: {msg}")
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Left:
+        if event.key() == Qt.Key.Key_Left:
             self.reject()
             return
         super().keyPressEvent(event)
@@ -1125,15 +1127,15 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         base_col_width = 90
         self.table.setColumnWidth(0, base_col_width * 2)  # Name: twice the width of the rest
         for col in range(1, len(COLUMNS)):
             self.table.setColumnWidth(col, base_col_width)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSortingEnabled(True)
-        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
         self.table.cellDoubleClicked.connect(self.show_tracker_peer_info)
         self.table.installEventFilter(self)
@@ -1150,7 +1152,7 @@ class MainWindow(QMainWindow):
     def build_tray_icon(self):
         icon = QIcon.fromTheme("network-transmit-receive")
         if icon.isNull():
-            icon = self.style().standardIcon(QStyle.SP_DriveNetIcon)
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DriveNetIcon)
         self.tray_icon = QSystemTrayIcon(icon, self)
         self.tray_icon.setToolTip("rtorrent GUI")
 
@@ -1169,7 +1171,7 @@ class MainWindow(QMainWindow):
             self.tray_icon.show()
 
     def on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.Trigger:  # left click
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:  # left click
             self.setVisible(not self.isVisible())
             if self.isVisible():
                 self.raise_()
@@ -1308,7 +1310,7 @@ class MainWindow(QMainWindow):
 
     def open_settings(self):
         dlg = SettingsDialog(self, self.cfg)
-        if dlg.exec_() == QDialog.Accepted:
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             was_connected = self.tunnel is not None and self.tunnel.is_running()
             if was_connected:
                 self.disconnect_all()
@@ -1418,7 +1420,7 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"Download complete: {name}", 6000)
         if QSystemTrayIcon.isSystemTrayAvailable() and self.tray_icon.isVisible():
             self.tray_icon.showMessage(
-                "Download complete", name, QSystemTrayIcon.Information, 6000
+                "Download complete", name, QSystemTrayIcon.MessageIcon.Information, 6000
             )
 
     def on_data_ready(self, torrents):
@@ -1447,7 +1449,7 @@ class MainWindow(QMainWindow):
             total_up += t["up_rate"]
 
             name_item = QTableWidgetItem(t["name"])
-            name_item.setData(Qt.UserRole, t["hash"])
+            name_item.setData(Qt.ItemDataRole.UserRole, t["hash"])
             self.table.setItem(row, 0, name_item)
             status_item = QTableWidgetItem(status)
             if t["message"]:
@@ -1470,7 +1472,7 @@ class MainWindow(QMainWindow):
             self.table.clearSelection()
             for row in range(self.table.rowCount()):
                 item = self.table.item(row, 0)
-                if item and item.data(Qt.UserRole) in previously_selected:
+                if item and item.data(Qt.ItemDataRole.UserRole) in previously_selected:
                     self.table.selectRow(row)
 
         self.table.blockSignals(False)
@@ -1498,7 +1500,7 @@ class MainWindow(QMainWindow):
         for row in rows:
             item = self.table.item(row, 0)
             if item:
-                hashes.append(item.data(Qt.UserRole))
+                hashes.append(item.data(Qt.ItemDataRole.UserRole))
         return hashes
 
     def show_context_menu(self, pos):
@@ -1518,7 +1520,7 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
         erase_action = menu.addAction("Remove from list (keep files)")
         delete_action = menu.addAction("Remove and delete files...")
-        action = menu.exec_(self.table.viewport().mapToGlobal(pos))
+        action = menu.exec(self.table.viewport().mapToGlobal(pos))
         if action == start_action:
             self.run_action("d.start", hashes)
         elif action == stop_action:
@@ -1536,15 +1538,15 @@ class MainWindow(QMainWindow):
         item = self.table.item(row, 0)
         if not item or not self.rpc:
             return
-        self.open_tracker_peer_dialog(item.data(Qt.UserRole))
+        self.open_tracker_peer_dialog(item.data(Qt.ItemDataRole.UserRole))
 
     def eventFilter(self, obj, event):
-        if obj is self.table and event.type() == QEvent.KeyPress and event.key() == Qt.Key_Right:
+        if obj is self.table and event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Right:
             row = self.table.currentRow()
             if row >= 0 and self.rpc:
                 item = self.table.item(row, 0)
                 if item:
-                    self.open_tracker_peer_dialog(item.data(Qt.UserRole))
+                    self.open_tracker_peer_dialog(item.data(Qt.ItemDataRole.UserRole))
                     return True
         return super().eventFilter(obj, event)
 
@@ -1552,7 +1554,7 @@ class MainWindow(QMainWindow):
         t = self.torrents_by_hash.get(torrent_hash)
         name = t["name"] if t else torrent_hash
         dlg = TrackerPeerDialog(self, self.rpc, torrent_hash, name, self.cfg.get("poll_interval", 3))
-        dlg.exec_()
+        dlg.exec()
 
     def run_action(self, method, hashes):
         self.action_worker = ActionWorker(self.rpc, method, hashes)
@@ -1575,10 +1577,10 @@ class MainWindow(QMainWindow):
             "torrent's hashes. It can take a while for large torrents and "
             "the torrent will be marked incomplete until the check finishes.\n\n"
             f"{preview}",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        if confirm != QMessageBox.Yes:
+        if confirm != QMessageBox.StandardButton.Yes:
             return
 
         count = len(hashes)
@@ -1624,9 +1626,9 @@ class MainWindow(QMainWindow):
             )
 
         confirm = QMessageBox.question(
-            self, title, text, QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            self, title, text, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
         )
-        if confirm != QMessageBox.Yes:
+        if confirm != QMessageBox.StandardButton.Yes:
             return
 
         self.delete_worker = DeleteWorker(self.rpc, self.cfg, items, delete_files)
@@ -1704,7 +1706,7 @@ def main():
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
