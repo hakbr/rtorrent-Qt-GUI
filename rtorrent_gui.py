@@ -25,6 +25,7 @@ Run:
 import sys
 import os
 import json
+import re
 import socket
 import shlex
 import shutil
@@ -39,10 +40,17 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QMessageBox, QSpinBox, QDialog, QDialogButtonBox, QLabel, QComboBox,
     QMenu, QStatusBar, QAbstractItemView, QCheckBox, QFileDialog,
-    QSystemTrayIcon, QStyle
+    QSystemTrayIcon, QStyle, QTableView, QTabWidget, QListWidget,
+    QListWidgetItem, QPlainTextEdit, QSplitter, QToolButton, QDoubleSpinBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QProcess, QProcessEnvironment, QEvent
+from PyQt6.QtCore import (
+    Qt, QThread, pyqtSignal, QTimer, QProcess, QProcessEnvironment, QEvent,
+    QAbstractTableModel, QModelIndex, QSortFilterProxyModel
+)
 from PyQt6.QtGui import QIcon, QAction
+
+import copy
+import uuid
 
 # Password auth stores the secret in the OS keychain via the `keyring`
 # package when it's available (pip install keyring / apt install
@@ -77,6 +85,11 @@ DEFAULT_CONFIG = {
     "poll_interval": 3,
     "disk_path": "/",  # remote path to report free disk space for
     "download_dir": "",  # remote directory new torrents are placed in; blank = rtorrent's own default
+    # rtorrent_autograb.py runs no web server; the GUI reads/writes its
+    # config and activity log by overwriting these files over the same
+    # SSH connection used for rtorrent RPC (see AutomationDialog).
+    "autograb_config_path": "~/.config/rtorrent-autograb/config.json",
+    "autograb_log_path": "~/.config/rtorrent-autograb/activity.json",
 }
 
 
@@ -836,6 +849,11 @@ class SettingsDialog(QDialog):
             "~/downloads (leave blank to use rtorrent's own default directory)"
         )
 
+        self.autograb_config_edit = QLineEdit(cfg.get("autograb_config_path", ""))
+        self.autograb_config_edit.setPlaceholderText("~/.config/rtorrent-autograb/config.json")
+        self.autograb_log_edit = QLineEdit(cfg.get("autograb_log_path", ""))
+        self.autograb_log_edit.setPlaceholderText("~/.config/rtorrent-autograb/activity.json")
+
         form = QFormLayout()
         form.addRow("RPC transport:", self.mode_combo)
         form.addRow(QLabel("<b>SSH</b>"))
@@ -857,6 +875,10 @@ class SettingsDialog(QDialog):
         form.addRow("Disk usage path:", self.disk_path_edit)
         form.addRow(QLabel("<b>New torrents</b>"))
         form.addRow("Default download dir:", self.download_dir_edit)
+        form.addRow(QLabel("<b>Automation (rtorrent_autograb.py, reached over the SSH connection above --"
+                            " it runs no web server of its own)</b>"))
+        form.addRow("Remote config path:", self.autograb_config_edit)
+        form.addRow("Remote activity log path:", self.autograb_log_edit)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -901,6 +923,8 @@ class SettingsDialog(QDialog):
         cfg["poll_interval"] = self.poll_spin.value()
         cfg["disk_path"] = self.disk_path_edit.text().strip() or "/"
         cfg["download_dir"] = self.download_dir_edit.text().strip()
+        cfg["autograb_config_path"] = self.autograb_config_edit.text().strip()
+        cfg["autograb_log_path"] = self.autograb_log_edit.text().strip()
 
         new_password = self.password_edit.text()
         if self._forget_password and not new_password:
@@ -912,24 +936,192 @@ class SettingsDialog(QDialog):
 
 
 # --------------------------------------------------------------------------
-# Table item with proper numeric sorting
+# Torrent table model
 # --------------------------------------------------------------------------
-
-class NumericItem(QTableWidgetItem):
-    def __init__(self, text, sort_value):
-        super().__init__(text)
-        self.sort_value = sort_value
-
-    def __lt__(self, other):
-        if isinstance(other, NumericItem):
-            return self.sort_value < other.sort_value
-        return super().__lt__(other)
-
+#
+# With thousands of torrents, rebuilding a QTableWidget from scratch on every
+# poll (as the old code did: setRowCount() then setItem() for every cell)
+# means allocating and re-laying-out tens of thousands of QTableWidgetItem
+# objects several times a minute -- visibly janky at scale. Instead this is a
+# QAbstractTableModel backing a QTableView: on each poll we diff the new
+# torrent list against what's already shown, and only touch what changed --
+# update in-place rows whose values actually differ (dataChanged, batched
+# into contiguous ranges), insert genuinely new torrents, and remove ones
+# that vanished. An unchanged torrent (the overwhelmingly common case between
+# polls when nothing is up/downloading) costs a single dict comparison, not a
+# widget rebuild. Sorting and name-filtering are handled by a
+# QSortFilterProxyModel on top so the view never has to touch the raw list.
 
 COLUMNS = [
     "Name", "Status", "Progress", "Down Speed", "Up Speed",
     "ETA", "Peers", "Ratio", "Size", "Downloaded", "Uploaded",
 ]
+
+SORT_VALUE_ROLE = Qt.ItemDataRole.UserRole + 1
+HASH_ROLE = Qt.ItemDataRole.UserRole
+
+
+def _build_row(t):
+    """Precomputes everything the model needs to display/sort a torrent, so
+    data() is just dict lookups (no formatting work on every repaint)."""
+    status = compute_status(t)
+    progress = (t["bytes_done"] / t["size_bytes"] * 100) if t["size_bytes"] else 0.0
+    eta_s = compute_eta_seconds(t)
+    ratio = t["ratio"] / 1000.0
+    display = [
+        t["name"],
+        status,
+        f"{progress:.1f}%",
+        human_speed(t["down_rate"]),
+        human_speed(t["up_rate"]),
+        format_eta(eta_s),
+        f"{t['peers_connected']} / {t['peers_not_connected']}",
+        f"{ratio:.2f}",
+        human_bytes(t["size_bytes"]),
+        human_bytes(t["down_total"]),
+        human_bytes(t["up_total"]),
+    ]
+    sort_values = [
+        t["name"].lower(),
+        status,
+        progress,
+        t["down_rate"],
+        t["up_rate"],
+        eta_s if eta_s is not None else float("inf"),
+        t["peers_connected"],
+        ratio,
+        t["size_bytes"],
+        t["down_total"],
+        t["up_total"],
+    ]
+    return {
+        "hash": t["hash"],
+        "message": t.get("message") or "",
+        "down_rate": t["down_rate"],
+        "up_rate": t["up_rate"],
+        "display": display,
+        "sort": sort_values,
+    }
+
+
+def _contiguous_ranges(sorted_indices):
+    """[2,3,4,7,8] -> [(2,4), (7,8)] -- lets us batch dataChanged/removeRows
+    calls instead of emitting one per row."""
+    ranges = []
+    start = prev = None
+    for i in sorted_indices:
+        if start is None:
+            start = prev = i
+        elif i == prev + 1:
+            prev = i
+        else:
+            ranges.append((start, prev))
+            start = prev = i
+    if start is not None:
+        ranges.append((start, prev))
+    return ranges
+
+
+class TorrentTableModel(QAbstractTableModel):
+    def __init__(self):
+        super().__init__()
+        self._rows = []          # list of row dicts, see _build_row()
+        self._row_by_hash = {}   # hash -> row index, for O(1) lookups
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(COLUMNS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return COLUMNS[section]
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        row = self._rows[index.row()]
+        col = index.column()
+        if role == Qt.ItemDataRole.DisplayRole:
+            return row["display"][col]
+        if role == SORT_VALUE_ROLE:
+            return row["sort"][col]
+        if role == HASH_ROLE:
+            return row["hash"]
+        if role == Qt.ItemDataRole.ToolTipRole and col == 1:
+            return row["message"] or None
+        return None
+
+    def hash_at(self, row_idx):
+        if 0 <= row_idx < len(self._rows):
+            return self._rows[row_idx]["hash"]
+        return None
+
+    def row_of_hash(self, h):
+        return self._row_by_hash.get(h)
+
+    def totals(self):
+        down = sum(r["down_rate"] for r in self._rows)
+        up = sum(r["up_rate"] for r in self._rows)
+        return down, up
+
+    def _rebuild_index(self):
+        self._row_by_hash = {row["hash"]: i for i, row in enumerate(self._rows)}
+
+    def update_torrents(self, torrents):
+        """Diffs `torrents` against what's currently shown and applies only
+        the minimal set of insert/update/remove operations. See the module
+        comment above for why this matters at thousands-of-rows scale."""
+        new_by_hash = {t["hash"]: t for t in torrents}
+        old_hashes = set(self._row_by_hash.keys())
+        new_hashes = set(new_by_hash.keys())
+
+        removed = old_hashes - new_hashes
+        added = new_hashes - old_hashes
+        kept = old_hashes & new_hashes
+
+        if removed:
+            remove_rows = sorted(self._row_by_hash[h] for h in removed)
+            # Remove highest-indexed ranges first so earlier indices stay valid.
+            for start, end in reversed(_contiguous_ranges(remove_rows)):
+                self.beginRemoveRows(QModelIndex(), start, end)
+                del self._rows[start:end + 1]
+                self.endRemoveRows()
+            self._rebuild_index()
+
+        changed_rows = []
+        for h in kept:
+            row_idx = self._row_by_hash[h]
+            new_row = _build_row(new_by_hash[h])
+            if new_row["display"] != self._rows[row_idx]["display"]:
+                self._rows[row_idx] = new_row
+                changed_rows.append(row_idx)
+        for start, end in _contiguous_ranges(sorted(changed_rows)):
+            top_left = self.index(start, 0)
+            bottom_right = self.index(end, self.columnCount() - 1)
+            self.dataChanged.emit(top_left, bottom_right)
+
+        if added:
+            new_rows = [_build_row(new_by_hash[h]) for h in added]
+            start = len(self._rows)
+            self.beginInsertRows(QModelIndex(), start, start + len(new_rows) - 1)
+            self._rows.extend(new_rows)
+            self.endInsertRows()
+            self._rebuild_index()
+
+
+class TorrentFilterProxy(QSortFilterProxyModel):
+    """Sorts by the precomputed numeric sort value (not the display text, so
+    e.g. '2 GiB' correctly sorts above '100 MiB'); filters by name substring."""
+
+    def __init__(self):
+        super().__init__()
+        self.setSortRole(SORT_VALUE_ROLE)
+        self.setFilterKeyColumn(0)
+        self.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.setDynamicSortFilter(True)
 
 
 # --------------------------------------------------------------------------
@@ -1037,6 +1229,695 @@ class TrackerPeerDialog(QDialog):
 
 
 # --------------------------------------------------------------------------
+# rtorrent_autograb.py remote config access (over SSH -- no web server)
+# --------------------------------------------------------------------------
+#
+# rtorrent_autograb.py opens no network listener of its own. Its config and
+# activity log are just files on the server, so the GUI reads and writes
+# them the same way it already deletes torrent files: a plain `ssh
+# user@host "..."` invocation (through sshpass when password auth is
+# configured), reusing the exact SSH plumbing above. Writes go to a
+# `<path>.tmp` then `mv` into place so a reader (or the daemon reloading on
+# mtime change) never sees a half-written file.
+
+class RemoteConfigError(Exception):
+    pass
+
+
+def _quote_remote_path(path):
+    """shlex.quote() wraps the *entire* string in single quotes whenever it
+    contains a '~', which disables the remote shell's tilde expansion --
+    `cat -- '~/foo'` looks for a file literally named '~/foo' and fails,
+    even though the real file is right there under the actual home
+    directory. Keep a leading '~' or '~username' unquoted so the shell
+    still expands it, and safely quote everything after it."""
+    if path.startswith("~"):
+        prefix, sep, rest = path.partition("/")
+        if rest:
+            return prefix + sep + shlex.quote(rest)
+        return prefix
+    return shlex.quote(path)
+
+
+class RemoteConfigClient:
+    def __init__(self, cfg, timeout=15):
+        self.cfg = cfg
+        self.timeout = timeout
+
+    def _run(self, remote_cmd, input_bytes=None):
+        try:
+            check_password_auth_ready(self.cfg)
+        except RuntimeError as e:
+            raise RemoteConfigError(str(e))
+        if not self.cfg.get("ssh_host") or not self.cfg.get("ssh_user"):
+            raise RemoteConfigError("SSH connection isn't configured yet (see Settings).")
+        cmd = wrap_ssh_command(self.cfg, [
+            "ssh",
+            *ssh_common_opts(self.cfg),
+            "-p", str(self.cfg["ssh_port"]),
+            f"{self.cfg['ssh_user']}@{self.cfg['ssh_host']}",
+            remote_cmd,
+        ])
+        try:
+            return subprocess.run(
+                cmd, input=input_bytes, capture_output=True, timeout=self.timeout,
+                env=ssh_subprocess_env(self.cfg),
+            )
+        except subprocess.TimeoutExpired:
+            raise RemoteConfigError("SSH command timed out.")
+        except RuntimeError as e:  # ssh_subprocess_env() missing password
+            raise RemoteConfigError(str(e))
+
+    def get_config(self, remote_path):
+        if not remote_path:
+            raise RemoteConfigError("No automation config path configured (see Settings).")
+        result = self._run(f"cat -- {_quote_remote_path(remote_path)}")
+        if result.returncode != 0:
+            raise RemoteConfigError(
+                result.stderr.decode("utf-8", "replace").strip()
+                or f"Could not read {remote_path} on the server."
+            )
+        try:
+            return json.loads(result.stdout.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            raise RemoteConfigError(f"Malformed config JSON on server: {e}")
+
+    def put_config(self, remote_path, cfg_dict):
+        if not remote_path:
+            raise RemoteConfigError("No automation config path configured (see Settings).")
+        data = json.dumps(cfg_dict, indent=2).encode("utf-8")
+        quoted = _quote_remote_path(remote_path)
+        tmp_quoted = _quote_remote_path(remote_path + ".tmp")
+        # Assume the config's parent directory already exists (rtorrent_autograb.py
+        # --init created it); this only needs to write the file itself.
+        remote_cmd = f"cat > {tmp_quoted} && mv -- {tmp_quoted} {quoted}"
+        result = self._run(remote_cmd, input_bytes=data)
+        if result.returncode != 0:
+            raise RemoteConfigError(
+                result.stderr.decode("utf-8", "replace").strip()
+                or "Failed to write config on server."
+            )
+
+    def get_log(self, remote_path, limit=200):
+        if not remote_path:
+            return []
+        result = self._run(f"cat -- {_quote_remote_path(remote_path)} 2>/dev/null || true")
+        raw = result.stdout.decode("utf-8", "replace").strip()
+        if not raw:
+            return []
+        try:
+            entries = json.loads(raw).get("entries", [])
+        except json.JSONDecodeError:
+            return []
+        return list(entries[-limit:][::-1])
+
+
+DEFAULT_FILTER = {
+    "name": "New filter", "enabled": True, "include_keywords": [], "include_mode": "any",
+    "exclude_keywords": [], "regex": "", "quality": [], "codecs": [], "min_size_mb": 0,
+    "max_size_mb": 0, "download_dir": "",
+}
+DEFAULT_IRC_SOURCE = {
+    "id": "", "enabled": True, "name": "New IRC source", "server": "", "port": 6697,
+    "tls": True, "tls_verify": True, "nick": "", "server_password": "", "nickserv_password": "",
+    "channels": [], "invite_command": "", "line_regex": "", "filters": [],
+}
+DEFAULT_RSS_SOURCE = {
+    "id": "", "enabled": True, "name": "New RSS feed", "url": "", "poll_interval_sec": 300, "filters": [],
+}
+
+
+def _csv_to_list(text):
+    return [p.strip() for p in text.split(",") if p.strip()]
+
+
+def _list_to_csv(items):
+    return ", ".join(items or [])
+
+
+def filter_matches(name: str, size_bytes, filt: dict):
+    """Local port of rtorrent_autograb.py's filter_matches(), used only for
+    the "Test..." preview button below -- no network round-trip needed."""
+    if not filt.get("enabled", True):
+        return False
+    lname = name.lower()
+    include = [k.lower() for k in filt.get("include_keywords", []) if k and k.strip()]
+    if include:
+        if filt.get("include_mode", "any") == "all":
+            if not all(k in lname for k in include):
+                return False
+        else:
+            if not any(k in lname for k in include):
+                return False
+    exclude = [k.lower() for k in filt.get("exclude_keywords", []) if k and k.strip()]
+    if any(k in lname for k in exclude):
+        return False
+    regex = (filt.get("regex") or "").strip()
+    if regex:
+        try:
+            if not re.search(regex, name, re.IGNORECASE):
+                return False
+        except re.error:
+            return False
+    quality = [q.lower() for q in filt.get("quality", []) if q and q.strip()]
+    if quality and not any(q in lname for q in quality):
+        return False
+    codecs = [c.lower() for c in filt.get("codecs", []) if c and c.strip()]
+    if codecs and not any(c in lname for c in codecs):
+        return False
+    if size_bytes is not None:
+        size_mb = size_bytes / (1024 * 1024)
+        min_mb = filt.get("min_size_mb") or 0
+        max_mb = filt.get("max_size_mb") or 0
+        if min_mb and size_mb < min_mb:
+            return False
+        if max_mb and size_mb > max_mb:
+            return False
+    return True
+
+
+class FilterEditorDialog(QDialog):
+    """Edits a single autograb filter (name/quality/codec keywords, regex,
+    size range, and a per-filter download-dir override)."""
+
+    @staticmethod
+    def _hint(text):
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet("color: palette(mid); font-style: italic;")
+        return label
+
+    def __init__(self, parent, filt):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Filter")
+        self.setMinimumWidth(460)
+        f = dict(DEFAULT_FILTER)
+        f.update(filt or {})
+
+        self.name_edit = QLineEdit(f["name"])
+        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check.setChecked(bool(f["enabled"]))
+
+        self.include_edit = QLineEdit(_list_to_csv(f["include_keywords"]))
+        self.include_edit.setPlaceholderText("e.g. bike, car")
+        self.include_mode_combo = QComboBox()
+        # Item text spells out the example concretely, since "any" / "all"
+        # alone is exactly the kind of thing that's ambiguous until you've
+        # seen it applied to your own words.
+        self.include_mode_combo.addItem(
+            "Match ANY of these (OR) — \u201cbike, car\u201d adds releases with either word", "any")
+        self.include_mode_combo.addItem(
+            "Match ALL of these (AND) — \u201cbike, car\u201d only adds releases with both words", "all")
+        include_mode_idx = self.include_mode_combo.findData(f.get("include_mode", "any"))
+        self.include_mode_combo.setCurrentIndex(max(include_mode_idx, 0))
+
+        self.exclude_edit = QLineEdit(_list_to_csv(f["exclude_keywords"]))
+        self.exclude_edit.setPlaceholderText("e.g. cam, telesync")
+
+        self.regex_edit = QLineEdit(f["regex"])
+        self.regex_edit.setPlaceholderText("optional extra regex (Python re, case-insensitive)")
+
+        self.quality_edit = QLineEdit(_list_to_csv(f["quality"]))
+        self.quality_edit.setPlaceholderText("e.g. 1080p, 2160p")
+
+        self.codecs_edit = QLineEdit(_list_to_csv(f["codecs"]))
+        self.codecs_edit.setPlaceholderText("e.g. x265, x264")
+
+        self.min_size_spin = QSpinBox()
+        self.min_size_spin.setRange(0, 999999)
+        self.min_size_spin.setSuffix(" MB")
+        self.min_size_spin.setSpecialValueText("No minimum")
+        self.min_size_spin.setValue(int(f["min_size_mb"]))
+        self.max_size_spin = QSpinBox()
+        self.max_size_spin.setRange(0, 999999)
+        self.max_size_spin.setSuffix(" MB")
+        self.max_size_spin.setSpecialValueText("No maximum")
+        self.max_size_spin.setValue(int(f["max_size_mb"]))
+        self.download_dir_edit = QLineEdit(f["download_dir"])
+        self.download_dir_edit.setPlaceholderText("blank = server's default download dir")
+
+        form = QFormLayout()
+        form.addRow("Name:", self.name_edit)
+        form.addRow("", self.enabled_check)
+        form.addRow("Include keywords:", self.include_edit)
+        form.addRow("Match mode:", self.include_mode_combo)
+        form.addRow("", self._hint(
+            "Comma-separated words or phrases. Leave blank to skip this check entirely "
+            "(everything passes). With multiple words, \u201cMatch mode\u201d above decides "
+            "whether ONE of them is enough (OR) or the release must contain EVERY one (AND)."
+        ))
+        form.addRow("Exclude keywords:", self.exclude_edit)
+        form.addRow("", self._hint(
+            "Always OR: the release is rejected if its name contains ANY one of these words."
+        ))
+        form.addRow("Regex (optional):", self.regex_edit)
+        form.addRow("Quality tags:", self.quality_edit)
+        form.addRow("Codec tags:", self.codecs_edit)
+        form.addRow("", self._hint(
+            "Quality and codec tags are always OR (treated as acceptable alternatives) — "
+            "\u201c1080p, 2160p\u201d matches a release tagged with either one, since a release "
+            "is normally only tagged with one resolution or codec anyway."
+        ))
+        form.addRow("Min size:", self.min_size_spin)
+        form.addRow("Max size:", self.max_size_spin)
+        form.addRow("Download dir override:", self.download_dir_edit)
+
+        self.test_name_edit = QLineEdit()
+        self.test_name_edit.setPlaceholderText("Paste a sample release name to test this filter against...")
+        self.test_result_label = QLabel("")
+        test_btn = QPushButton("Test")
+        test_btn.clicked.connect(self.run_test)
+        test_row = QHBoxLayout()
+        test_row.addWidget(self.test_name_edit, 1)
+        test_row.addWidget(test_btn)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("<b>Test</b> (checked locally, doesn't touch the server)"))
+        layout.addLayout(test_row)
+        layout.addWidget(self.test_result_label)
+        layout.addWidget(buttons)
+
+    def run_test(self):
+        name = self.test_name_edit.text().strip()
+        if not name:
+            self.test_result_label.setText("")
+            return
+        matches = filter_matches(name, None, self.get_filter())
+        if matches:
+            self.test_result_label.setText("✓ Matches (size range is skipped in this preview)")
+        else:
+            self.test_result_label.setText("✗ Does not match")
+
+    def get_filter(self):
+        return {
+            "name": self.name_edit.text().strip() or "Unnamed filter",
+            "enabled": self.enabled_check.isChecked(),
+            "include_keywords": _csv_to_list(self.include_edit.text()),
+            "include_mode": self.include_mode_combo.currentData() or "any",
+            "exclude_keywords": _csv_to_list(self.exclude_edit.text()),
+            "regex": self.regex_edit.text().strip(),
+            "quality": _csv_to_list(self.quality_edit.text()),
+            "codecs": _csv_to_list(self.codecs_edit.text()),
+            "min_size_mb": self.min_size_spin.value(),
+            "max_size_mb": self.max_size_spin.value(),
+            "download_dir": self.download_dir_edit.text().strip(),
+        }
+
+
+class FilterListWidget(QWidget):
+    """Reusable "list of filters" editor embedded in both the IRC and RSS
+    source dialogs: Add / Edit / Remove buttons next to a QListWidget."""
+
+    def __init__(self, parent, filters):
+        super().__init__(parent)
+        self.filters = [dict(DEFAULT_FILTER, **f) for f in (filters or [])]
+
+        self.list_widget = QListWidget()
+        self._refresh_list()
+
+        add_btn = QPushButton("Add...")
+        add_btn.clicked.connect(self.add_filter)
+        edit_btn = QPushButton("Edit...")
+        edit_btn.clicked.connect(self.edit_filter)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self.remove_filter)
+
+        btn_col = QVBoxLayout()
+        btn_col.addWidget(add_btn)
+        btn_col.addWidget(edit_btn)
+        btn_col.addWidget(remove_btn)
+        btn_col.addStretch()
+
+        row = QHBoxLayout(self)
+        row.addWidget(self.list_widget, 1)
+        btn_col_w = QWidget()
+        btn_col_w.setLayout(btn_col)
+        row.addWidget(btn_col_w)
+
+    def _refresh_list(self):
+        self.list_widget.clear()
+        for f in self.filters:
+            label = f["name"]
+            if len(f.get("include_keywords") or []) > 1:
+                label += "  [AND]" if f.get("include_mode", "any") == "all" else "  [OR]"
+            if not f.get("enabled", True):
+                label += "  (disabled)"
+            self.list_widget.addItem(QListWidgetItem(label))
+
+    def add_filter(self):
+        dlg = FilterEditorDialog(self, {})
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.filters.append(dlg.get_filter())
+            self._refresh_list()
+
+    def edit_filter(self):
+        row = self.list_widget.currentRow()
+        if row < 0:
+            return
+        dlg = FilterEditorDialog(self, self.filters[row])
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.filters[row] = dlg.get_filter()
+            self._refresh_list()
+
+    def remove_filter(self):
+        row = self.list_widget.currentRow()
+        if row < 0:
+            return
+        del self.filters[row]
+        self._refresh_list()
+
+
+class IrcSourceDialog(QDialog):
+    def __init__(self, parent, source):
+        super().__init__(parent)
+        self.setWindowTitle("IRC Announce Source")
+        self.setMinimumWidth(460)
+        s = dict(DEFAULT_IRC_SOURCE)
+        s.update(source or {})
+        self._id = s["id"]
+
+        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check.setChecked(bool(s["enabled"]))
+        self.name_edit = QLineEdit(s["name"])
+        self.server_edit = QLineEdit(s["server"])
+        self.server_edit.setPlaceholderText("irc.example.net")
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(int(s["port"]))
+        self.tls_check = QCheckBox("Use TLS")
+        self.tls_check.setChecked(bool(s["tls"]))
+        self.tls_verify_check = QCheckBox("Verify TLS certificate")
+        self.tls_verify_check.setChecked(bool(s["tls_verify"]))
+        self.nick_edit = QLineEdit(s["nick"])
+        self.server_password_edit = QLineEdit(s["server_password"])
+        self.server_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.nickserv_password_edit = QLineEdit(s["nickserv_password"])
+        self.nickserv_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.channels_edit = QLineEdit(_list_to_csv(s["channels"]))
+        self.channels_edit.setPlaceholderText("#announce, #announce2")
+        self.invite_edit = QLineEdit(s["invite_command"])
+        self.invite_edit.setPlaceholderText("optional, sent once after connecting")
+        self.line_regex_edit = QLineEdit(s["line_regex"])
+        self.line_regex_edit.setPlaceholderText("optional; blank = auto-detect magnet/.torrent links")
+
+        form = QFormLayout()
+        form.addRow("", self.enabled_check)
+        form.addRow("Name:", self.name_edit)
+        form.addRow("Server:", self.server_edit)
+        form.addRow("Port:", self.port_spin)
+        form.addRow("", self.tls_check)
+        form.addRow("", self.tls_verify_check)
+        form.addRow("Nick:", self.nick_edit)
+        form.addRow("Server password:", self.server_password_edit)
+        form.addRow("NickServ password:", self.nickserv_password_edit)
+        form.addRow("Channels:", self.channels_edit)
+        form.addRow("Invite command:", self.invite_edit)
+        form.addRow("Line regex:", self.line_regex_edit)
+
+        self.filter_list = FilterListWidget(self, s["filters"])
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("<b>Filters</b> (a release is grabbed if it matches any one of these)"))
+        layout.addWidget(self.filter_list)
+        layout.addWidget(buttons)
+
+    def get_source(self):
+        return {
+            "id": self._id or uuid.uuid4().hex[:8],
+            "enabled": self.enabled_check.isChecked(),
+            "name": self.name_edit.text().strip() or "Unnamed IRC source",
+            "server": self.server_edit.text().strip(),
+            "port": self.port_spin.value(),
+            "tls": self.tls_check.isChecked(),
+            "tls_verify": self.tls_verify_check.isChecked(),
+            "nick": self.nick_edit.text().strip(),
+            "server_password": self.server_password_edit.text(),
+            "nickserv_password": self.nickserv_password_edit.text(),
+            "channels": _csv_to_list(self.channels_edit.text()),
+            "invite_command": self.invite_edit.text().strip(),
+            "line_regex": self.line_regex_edit.text().strip(),
+            "filters": self.filter_list.filters,
+        }
+
+
+class RssSourceDialog(QDialog):
+    def __init__(self, parent, source):
+        super().__init__(parent)
+        self.setWindowTitle("RSS Feed Source")
+        self.setMinimumWidth(460)
+        s = dict(DEFAULT_RSS_SOURCE)
+        s.update(source or {})
+        self._id = s["id"]
+
+        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check.setChecked(bool(s["enabled"]))
+        self.name_edit = QLineEdit(s["name"])
+        self.url_edit = QLineEdit(s["url"])
+        self.url_edit.setPlaceholderText("https://example.com/rss?key=...")
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(30, 86400)
+        self.interval_spin.setSuffix(" s")
+        self.interval_spin.setValue(int(s["poll_interval_sec"]))
+
+        form = QFormLayout()
+        form.addRow("", self.enabled_check)
+        form.addRow("Name:", self.name_edit)
+        form.addRow("Feed URL:", self.url_edit)
+        form.addRow("Poll every:", self.interval_spin)
+
+        self.filter_list = FilterListWidget(self, s["filters"])
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("<b>Filters</b> (an item is grabbed if it matches any one of these)"))
+        layout.addWidget(self.filter_list)
+        layout.addWidget(buttons)
+
+    def get_source(self):
+        return {
+            "id": self._id or uuid.uuid4().hex[:8],
+            "enabled": self.enabled_check.isChecked(),
+            "name": self.name_edit.text().strip() or "Unnamed RSS feed",
+            "url": self.url_edit.text().strip(),
+            "poll_interval_sec": self.interval_spin.value(),
+            "filters": self.filter_list.filters,
+        }
+
+
+class AutomationDialog(QDialog):
+    """Views/edits rtorrent_autograb.py's IRC sources, RSS feeds, and their
+    filters by reading/writing its config file over SSH (the daemon runs no
+    web server), plus a read-only recent-activity log read the same way."""
+
+    def __init__(self, parent, client: RemoteConfigClient, config_path: str, log_path: str):
+        super().__init__(parent)
+        self.setWindowTitle("Automation — IRC & RSS auto-add")
+        self.resize(720, 520)
+        self.client = client
+        self.config_path = config_path
+        self.log_path = log_path
+        self.cfg = None  # loaded lazily
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+
+        self.irc_table = QTableWidget(0, 3)
+        self.irc_table.setHorizontalHeaderLabels(["Name", "Server", "Channels"])
+        self.irc_table.horizontalHeader().setStretchLastSection(True)
+        self.irc_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.irc_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.irc_table.doubleClicked.connect(lambda _: self.edit_irc_source())
+        irc_tab = self._build_source_tab(
+            self.irc_table, self.add_irc_source, self.edit_irc_source, self.remove_irc_source
+        )
+
+        self.rss_table = QTableWidget(0, 3)
+        self.rss_table.setHorizontalHeaderLabels(["Name", "Feed URL", "Interval"])
+        self.rss_table.horizontalHeader().setStretchLastSection(True)
+        self.rss_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rss_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.rss_table.doubleClicked.connect(lambda _: self.edit_rss_source())
+        rss_tab = self._build_source_tab(
+            self.rss_table, self.add_rss_source, self.edit_rss_source, self.remove_rss_source
+        )
+
+        self.log_table = QTableWidget(0, 5)
+        self.log_table.setHorizontalHeaderLabels(["Time", "Source", "Name", "Status", "Detail"])
+        self.log_table.horizontalHeader().setStretchLastSection(True)
+        self.log_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        log_refresh_btn = QPushButton("Refresh log")
+        log_refresh_btn.clicked.connect(self.refresh_log)
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
+        log_layout.addWidget(self.log_table)
+        log_layout.addWidget(log_refresh_btn)
+
+        tabs = QTabWidget()
+        tabs.addTab(irc_tab, "IRC Sources")
+        tabs.addTab(rss_tab, "RSS Feeds")
+        tabs.addTab(log_tab, "Activity Log")
+
+        reload_btn = QPushButton("Reload from server")
+        reload_btn.clicked.connect(self.load_config)
+        save_btn = QPushButton("Save to server")
+        save_btn.clicked.connect(self.save_config)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(reload_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(close_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status_label)
+        layout.addWidget(tabs)
+        layout.addLayout(btn_row)
+
+        self.load_config()
+
+    def _build_source_tab(self, table, add_fn, edit_fn, remove_fn):
+        add_btn = QPushButton("Add...")
+        add_btn.clicked.connect(add_fn)
+        edit_btn = QPushButton("Edit...")
+        edit_btn.clicked.connect(edit_fn)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(remove_fn)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(edit_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch()
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(table)
+        layout.addLayout(btn_row)
+        return tab
+
+    # -- data loading / saving -------------------------------------------
+
+    def load_config(self):
+        try:
+            self.cfg = self.client.get_config(self.config_path)
+            self.status_label.setText(f"Loaded {self.config_path} over SSH.")
+        except RemoteConfigError as e:
+            self.cfg = {"irc_sources": [], "rss_sources": []}
+            self.status_label.setText(f"⚠ {e}")
+        self._refresh_irc_table()
+        self._refresh_rss_table()
+        self.refresh_log()
+
+    def save_config(self):
+        if self.cfg is None:
+            return
+        try:
+            self.client.put_config(self.config_path, self.cfg)
+            self.status_label.setText(
+                "Saved over SSH. rtorrent_autograb.py picks up the change "
+                "within a few seconds (it watches the file, no restart needed)."
+            )
+        except RemoteConfigError as e:
+            QMessageBox.warning(self, "Save failed", str(e))
+
+    def refresh_log(self):
+        try:
+            entries = self.client.get_log(self.log_path)
+        except RemoteConfigError as e:
+            self.status_label.setText(f"⚠ {e}")
+            return
+        self.log_table.setRowCount(len(entries))
+        for row, e in enumerate(entries):
+            self.log_table.setItem(row, 0, QTableWidgetItem(e.get("time", "")))
+            self.log_table.setItem(row, 1, QTableWidgetItem(f"{e.get('source_type','')}: {e.get('source_name','')}"))
+            self.log_table.setItem(row, 2, QTableWidgetItem(e.get("name", "")))
+            self.log_table.setItem(row, 3, QTableWidgetItem(e.get("status", "")))
+            self.log_table.setItem(row, 4, QTableWidgetItem(e.get("detail", "")))
+
+    # -- IRC sources -------------------------------------------------------
+
+    def _refresh_irc_table(self):
+        sources = self.cfg.get("irc_sources", [])
+        self.irc_table.setRowCount(len(sources))
+        for row, s in enumerate(sources):
+            name = s["name"] + ("" if s.get("enabled", True) else "  (disabled)")
+            self.irc_table.setItem(row, 0, QTableWidgetItem(name))
+            self.irc_table.setItem(row, 1, QTableWidgetItem(f"{s.get('server','')}:{s.get('port','')}"))
+            self.irc_table.setItem(row, 2, QTableWidgetItem(_list_to_csv(s.get("channels", []))))
+
+    def add_irc_source(self):
+        dlg = IrcSourceDialog(self, {})
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.cfg.setdefault("irc_sources", []).append(dlg.get_source())
+            self._refresh_irc_table()
+
+    def edit_irc_source(self):
+        row = self.irc_table.currentRow()
+        sources = self.cfg.get("irc_sources", [])
+        if row < 0 or row >= len(sources):
+            return
+        dlg = IrcSourceDialog(self, sources[row])
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            sources[row] = dlg.get_source()
+            self._refresh_irc_table()
+
+    def remove_irc_source(self):
+        row = self.irc_table.currentRow()
+        sources = self.cfg.get("irc_sources", [])
+        if row < 0 or row >= len(sources):
+            return
+        del sources[row]
+        self._refresh_irc_table()
+
+    # -- RSS sources ---------------------------------------------------
+
+    def _refresh_rss_table(self):
+        sources = self.cfg.get("rss_sources", [])
+        self.rss_table.setRowCount(len(sources))
+        for row, s in enumerate(sources):
+            name = s["name"] + ("" if s.get("enabled", True) else "  (disabled)")
+            self.rss_table.setItem(row, 0, QTableWidgetItem(name))
+            self.rss_table.setItem(row, 1, QTableWidgetItem(s.get("url", "")))
+            self.rss_table.setItem(row, 2, QTableWidgetItem(f"{s.get('poll_interval_sec', 0)} s"))
+
+    def add_rss_source(self):
+        dlg = RssSourceDialog(self, {})
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.cfg.setdefault("rss_sources", []).append(dlg.get_source())
+            self._refresh_rss_table()
+
+    def edit_rss_source(self):
+        row = self.rss_table.currentRow()
+        sources = self.cfg.get("rss_sources", [])
+        if row < 0 or row >= len(sources):
+            return
+        dlg = RssSourceDialog(self, sources[row])
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            sources[row] = dlg.get_source()
+            self._refresh_rss_table()
+
+    def remove_rss_source(self):
+        row = self.rss_table.currentRow()
+        sources = self.cfg.get("rss_sources", [])
+        if row < 0 or row >= len(sources):
+            return
+        del sources[row]
+        self._refresh_rss_table()
+
+
+# --------------------------------------------------------------------------
 # Main window
 # --------------------------------------------------------------------------
 
@@ -1061,6 +1942,10 @@ class MainWindow(QMainWindow):
         self.set_limit_worker = None
         self.tracker_peer_dialog = None
         self.prev_complete = {}  # hash -> bool, used to detect completions
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.timeout.connect(self.apply_filter)
+        self.autograb_client = None
 
         self.build_ui()
         self.build_tray_icon()
@@ -1077,13 +1962,16 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self.open_settings)
         refresh_btn = QPushButton("Refresh now")
         refresh_btn.clicked.connect(self.poll_now)
+        automation_btn = QPushButton("Automation...")
+        automation_btn.clicked.connect(self.open_automation_dialog)
         top_row.addWidget(self.connect_btn)
         top_row.addWidget(settings_btn)
         top_row.addWidget(refresh_btn)
+        top_row.addWidget(automation_btn)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Filter by name...")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.textChanged.connect(self.apply_filter)
+        self.search_edit.textChanged.connect(self.on_search_text_changed)
         self.search_edit.setMinimumWidth(220)
         top_row.addWidget(self.search_edit)
         top_row.addStretch()
@@ -1125,19 +2013,31 @@ class MainWindow(QMainWindow):
         limits_row.addStretch()
         layout.addLayout(limits_row)
 
-        self.table = QTableWidget(0, len(COLUMNS))
-        self.table.setHorizontalHeaderLabels(COLUMNS)
+        self.torrent_model = TorrentTableModel()
+        self.proxy_model = TorrentFilterProxy()
+        self.proxy_model.setSourceModel(self.torrent_model)
+
+        self.table = QTableView()
+        self.table.setModel(self.proxy_model)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         base_col_width = 90
         self.table.setColumnWidth(0, base_col_width * 2)  # Name: twice the width of the rest
         for col in range(1, len(COLUMNS)):
             self.table.setColumnWidth(col, base_col_width)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        # ScrollPerPixel (vs. the default per-item) keeps scrolling smooth
+        # once the list is thousands of rows tall.
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setSortingEnabled(True)
+        self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
-        self.table.cellDoubleClicked.connect(self.show_tracker_peer_info)
+        self.table.doubleClicked.connect(self.show_tracker_peer_info)
         self.table.installEventFilter(self)
         layout.addWidget(self.table)
 
@@ -1319,6 +2219,26 @@ class MainWindow(QMainWindow):
             if was_connected:
                 self.connect_all()
 
+    def open_automation_dialog(self):
+        if not self.cfg.get("autograb_config_path"):
+            QMessageBox.information(
+                self, "Automation not configured",
+                "Set the remote config path (and activity log path) in Settings first "
+                "-- run rtorrent_autograb.py --init on the server to see the defaults. "
+                "It's reached over the same SSH connection as rtorrent, no server-side "
+                "webserver required."
+            )
+            self.open_settings()
+            if not self.cfg.get("autograb_config_path"):
+                return
+        client = RemoteConfigClient(self.cfg)
+        dlg = AutomationDialog(
+            self, client,
+            self.cfg.get("autograb_config_path", ""),
+            self.cfg.get("autograb_log_path", ""),
+        )
+        dlg.exec()
+
     # ---------------- polling & display ----------------
 
     def poll_now(self):
@@ -1428,79 +2348,58 @@ class MainWindow(QMainWindow):
         self.torrents_by_hash = {t["hash"]: t for t in torrents}
         self.check_completions(torrents)
 
-        # Row indices shift on every refresh (rows are recreated, and sorting
-        # can reorder them as values change), so remember what was selected
-        # by torrent hash rather than by row position and restore it after
-        # rebuilding — otherwise the highlight silently drifts onto whatever
-        # torrent happens to land in that row next.
+        # Selection is tracked by hash rather than row position, since row
+        # indices can shift as the diff-update inserts/removes/reorders rows.
         previously_selected = set(self.selected_hashes())
 
-        self.table.blockSignals(True)
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(torrents))
-
-        total_down = total_up = 0
-        for row, t in enumerate(torrents):
-            status = compute_status(t)
-            progress = (t["bytes_done"] / t["size_bytes"] * 100) if t["size_bytes"] else 0.0
-            eta_s = compute_eta_seconds(t)
-            ratio = t["ratio"] / 1000.0
-            total_down += t["down_rate"]
-            total_up += t["up_rate"]
-
-            name_item = QTableWidgetItem(t["name"])
-            name_item.setData(Qt.ItemDataRole.UserRole, t["hash"])
-            self.table.setItem(row, 0, name_item)
-            status_item = QTableWidgetItem(status)
-            if t["message"]:
-                status_item.setToolTip(t["message"])
-            self.table.setItem(row, 1, status_item)
-            self.table.setItem(row, 2, NumericItem(f"{progress:.1f}%", progress))
-            self.table.setItem(row, 3, NumericItem(human_speed(t["down_rate"]), t["down_rate"]))
-            self.table.setItem(row, 4, NumericItem(human_speed(t["up_rate"]), t["up_rate"]))
-            self.table.setItem(row, 5, NumericItem(format_eta(eta_s), eta_s if eta_s is not None else float("inf")))
-            self.table.setItem(row, 6, NumericItem(
-                f"{t['peers_connected']} / {t['peers_not_connected']}", t["peers_connected"]))
-            self.table.setItem(row, 7, NumericItem(f"{ratio:.2f}", ratio))
-            self.table.setItem(row, 8, NumericItem(human_bytes(t["size_bytes"]), t["size_bytes"]))
-            self.table.setItem(row, 9, NumericItem(human_bytes(t["down_total"]), t["down_total"]))
-            self.table.setItem(row, 10, NumericItem(human_bytes(t["up_total"]), t["up_total"]))
-
-        self.table.setSortingEnabled(True)
+        self.torrent_model.update_torrents(torrents)
 
         if previously_selected:
-            self.table.clearSelection()
-            for row in range(self.table.rowCount()):
-                item = self.table.item(row, 0)
-                if item and item.data(Qt.ItemDataRole.UserRole) in previously_selected:
-                    self.table.selectRow(row)
+            self.restore_selection(previously_selected)
 
-        self.table.blockSignals(False)
-
-        self.apply_filter()
-        visible = sum(1 for row in range(self.table.rowCount()) if not self.table.isRowHidden(row))
-        count_text = f"{len(torrents)} torrents" if visible == len(torrents) else f"{visible} of {len(torrents)} torrents"
+        total_down, total_up = self.torrent_model.totals()
+        total_count = len(torrents)
+        visible = self.proxy_model.rowCount()
+        count_text = f"{total_count} torrents" if visible == total_count else f"{visible} of {total_count} torrents"
         self.status_bar.showMessage(
             f"{count_text}  |  Total: \u2193 {human_speed(total_down)}  "
             f"\u2191 {human_speed(total_up)}"
         )
 
+    def restore_selection(self, hashes):
+        selection_model = self.table.selectionModel()
+        selection_model.blockSignals(True)
+        selection_model.clearSelection()
+        for h in hashes:
+            source_row = self.torrent_model.row_of_hash(h)
+            if source_row is None:
+                continue
+            proxy_index = self.proxy_model.mapFromSource(self.torrent_model.index(source_row, 0))
+            if proxy_index.isValid():
+                selection_model.select(
+                    proxy_index,
+                    selection_model.SelectionFlag.Select | selection_model.SelectionFlag.Rows,
+                )
+        selection_model.blockSignals(False)
+
     # ---------------- actions ----------------
 
+    def on_search_text_changed(self, text):
+        # Debounced: re-filtering thousands of rows on every single keystroke
+        # is wasted work, so wait for a short pause in typing instead.
+        self._filter_timer.start(250)
+
     def apply_filter(self):
-        query = self.search_edit.text().strip().lower()
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            name = item.text().lower() if item else ""
-            self.table.setRowHidden(row, bool(query) and query not in name)
+        query = self.search_edit.text().strip()
+        self.proxy_model.setFilterFixedString(query)
 
     def selected_hashes(self):
-        rows = {idx.row() for idx in self.table.selectedIndexes()}
         hashes = []
-        for row in rows:
-            item = self.table.item(row, 0)
-            if item:
-                hashes.append(item.data(Qt.ItemDataRole.UserRole))
+        for proxy_index in self.table.selectionModel().selectedRows(0):
+            source_index = self.proxy_model.mapToSource(proxy_index)
+            h = self.torrent_model.data(source_index, HASH_ROLE)
+            if h:
+                hashes.append(h)
         return hashes
 
     def show_context_menu(self, pos):
@@ -1534,19 +2433,22 @@ class MainWindow(QMainWindow):
         elif action == delete_action:
             self.erase_torrents(hashes, delete_files=True)
 
-    def show_tracker_peer_info(self, row, column):
-        item = self.table.item(row, 0)
-        if not item or not self.rpc:
+    def show_tracker_peer_info(self, proxy_index):
+        if not self.rpc or not proxy_index.isValid():
             return
-        self.open_tracker_peer_dialog(item.data(Qt.ItemDataRole.UserRole))
+        source_index = self.proxy_model.mapToSource(proxy_index)
+        h = self.torrent_model.data(source_index, HASH_ROLE)
+        if h:
+            self.open_tracker_peer_dialog(h)
 
     def eventFilter(self, obj, event):
         if obj is self.table and event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Right:
-            row = self.table.currentRow()
-            if row >= 0 and self.rpc:
-                item = self.table.item(row, 0)
-                if item:
-                    self.open_tracker_peer_dialog(item.data(Qt.ItemDataRole.UserRole))
+            proxy_index = self.table.currentIndex()
+            if proxy_index.isValid() and self.rpc:
+                source_index = self.proxy_model.mapToSource(proxy_index)
+                h = self.torrent_model.data(source_index, HASH_ROLE)
+                if h:
+                    self.open_tracker_peer_dialog(h)
                     return True
         return super().eventFilter(obj, event)
 
