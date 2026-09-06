@@ -356,11 +356,18 @@ class SeenStore:
             json.dump({"seen": self._seen}, f)
         tmp.replace(self.path)
 
-    def check_and_add(self, key):
-        """Returns True if key was NOT seen before (and marks it seen now)."""
+    def has(self, key):
+        with self._lock:
+            return key in self._seen_set
+
+    def mark(self, key):
+        """Records key as seen (idempotent). Only call this once something
+        has actually been added to rtorrent -- see the comment in
+        Watcher.handle_candidate for why filtered-out items must NOT be
+        marked seen here."""
         with self._lock:
             if key in self._seen_set:
-                return False
+                return
             self._seen.append(key)
             self._seen_set.add(key)
             if len(self._seen) > self.cap:
@@ -368,58 +375,67 @@ class SeenStore:
                 self._seen = self._seen[len(self._seen) - self.cap:]
                 self._seen_set.difference_update(drop)
             self._save()
-            return True
 
 
 # --------------------------------------------------------------------------
 # Filter matching
 # --------------------------------------------------------------------------
 
-def filter_matches(name: str, size_bytes, filt: dict):
+def filter_matches_verbose(name: str, size_bytes, filt: dict):
+    """Same checks as filter_matches(), but also returns a human-readable
+    reason for the result -- this is what makes "why didn't this get
+    grabbed" answerable from the activity log instead of guesswork."""
     if not filt.get("enabled", True):
-        return False
+        return False, "filter is disabled"
     lname = name.lower()
 
     include = [k.lower() for k in filt.get("include_keywords", []) if k and k.strip()]
     if include:
-        if filt.get("include_mode", "any") == "all":
-            if not all(k in lname for k in include):
-                return False
+        mode = filt.get("include_mode", "any")
+        if mode == "all":
+            missing = [k for k in include if k not in lname]
+            if missing:
+                return False, f"missing required keyword(s): {', '.join(missing)}"
         else:
             if not any(k in lname for k in include):
-                return False
+                return False, f"name doesn't contain any of: {', '.join(include)}"
 
     exclude = [k.lower() for k in filt.get("exclude_keywords", []) if k and k.strip()]
-    if any(k in lname for k in exclude):
-        return False
+    hit = next((k for k in exclude if k in lname), None)
+    if hit:
+        return False, f"excluded by keyword: {hit}"
 
     regex = (filt.get("regex") or "").strip()
     if regex:
         try:
             if not re.search(regex, name, re.IGNORECASE):
-                return False
+                return False, f"didn't match regex: {regex}"
         except re.error as e:
             log.warning("Invalid regex in filter %r: %s", filt.get("name"), e)
-            return False
+            return False, f"filter's regex is invalid: {e}"
 
     quality = [q.lower() for q in filt.get("quality", []) if q and q.strip()]
     if quality and not any(q in lname for q in quality):
-        return False
+        return False, f"no matching quality tag (wanted one of: {', '.join(quality)})"
 
     codecs = [c.lower() for c in filt.get("codecs", []) if c and c.strip()]
     if codecs and not any(c in lname for c in codecs):
-        return False
+        return False, f"no matching codec tag (wanted one of: {', '.join(codecs)})"
 
     if size_bytes is not None:
         size_mb = size_bytes / (1024 * 1024)
         min_mb = filt.get("min_size_mb") or 0
         max_mb = filt.get("max_size_mb") or 0
         if min_mb and size_mb < min_mb:
-            return False
+            return False, f"size {size_mb:.0f}MB is below the {min_mb}MB minimum"
         if max_mb and size_mb > max_mb:
-            return False
+            return False, f"size {size_mb:.0f}MB is above the {max_mb}MB maximum"
 
-    return True
+    return True, "matched"
+
+
+def filter_matches(name: str, size_bytes, filt: dict):
+    return filter_matches_verbose(name, size_bytes, filt)[0]
 
 
 def first_matching_filter(name, size_bytes, filters):
@@ -427,6 +443,19 @@ def first_matching_filter(name, size_bytes, filters):
         if filter_matches(name, size_bytes, f):
             return f
     return None
+
+
+def first_matching_filter_verbose(name, size_bytes, filters):
+    """Returns (matched_filter_or_None, [(filter_name, reason), ...]).
+    The reasons list covers every filter that was tried, so a caller can
+    show exactly why none of them matched."""
+    reasons = []
+    for f in filters:
+        ok, reason = filter_matches_verbose(name, size_bytes, f)
+        if ok:
+            return f, reasons
+        reasons.append((f.get("name", "?"), reason))
+    return None, reasons
 
 
 # --------------------------------------------------------------------------
@@ -635,20 +664,43 @@ class Watcher(threading.Thread):
         rt_cfg = self.cfg_store.get()["rtorrent"]
         user_agent = self.cfg_store.get()["user_agent"]
         source_name = self.source.get("name", self.source.get("id", "?"))
+        filters = self.source.get("filters") or []
 
-        if dedupe_key is not None and not self.seen.check_and_add(dedupe_key):
-            grab_log.add(self.source_type, source_name, name, "duplicate")
+        if not filters:
+            # A source with zero filters can never match anything -- this is
+            # the single most common reason "I added a feed/channel and
+            # nothing came through": there's no catch-all filter yet. (A
+            # filter with every field left blank matches everything, if
+            # that's what's wanted.)
+            grab_log.add(
+                self.source_type, source_name, name, "filtered_out",
+                detail="this source has no filters configured, so nothing can ever match -- "
+                       "add at least one filter (leave all fields blank to match everything)",
+            )
             return
 
-        filt = first_matching_filter(name, size_bytes, self.source.get("filters") or [])
+        filt, reasons = first_matching_filter_verbose(name, size_bytes, filters)
         if filt is None:
-            grab_log.add(self.source_type, source_name, name, "filtered_out")
+            detail = "; ".join(f"{fname}: {reason}" for fname, reason in reasons)
+            grab_log.add(self.source_type, source_name, name, "filtered_out", detail=detail)
+            return
+
+        # Dedupe is only checked/recorded once something actually matched a
+        # filter, and only marked seen after a successful add below. If this
+        # ran before the filter check, an item that was merely rejected once
+        # would stay "seen" forever -- so loosening the filter later (e.g.
+        # while tuning it) could never pick that item back up even though it
+        # never actually got added.
+        if dedupe_key is not None and self.seen.has(dedupe_key):
+            grab_log.add(self.source_type, source_name, name, "duplicate")
             return
 
         download_dir = filt.get("download_dir") or rt_cfg.get("download_dir") or ""
         try:
             rpc = make_rpc(rt_cfg)
             add_to_rtorrent(rpc, url, download_dir, user_agent)
+            if dedupe_key is not None:
+                self.seen.mark(dedupe_key)
             grab_log.add(self.source_type, source_name, name, "added", detail=f"matched filter '{filt.get('name')}'")
             log.info("[%s] Added: %s (filter: %s)", source_name, name, filt.get("name"))
         except Exception as e:
@@ -860,6 +912,12 @@ class SourceManager(threading.Thread):
                 continue
             kind, _id = key
             log.info("Starting %s watcher: %s", kind, source.get("name"))
+            if not any(f.get("enabled", True) for f in source.get("filters") or []):
+                log.warning(
+                    "%s source '%s' has no enabled filters -- nothing will ever be added "
+                    "from it. Add at least one filter (a filter with every field left blank "
+                    "matches everything).", kind.upper(), source.get("name"),
+                )
             cls = IrcWatcher if kind == "irc" else RssWatcher
             w = cls(source, self.cfg_store, self.seen)
             w.start()
