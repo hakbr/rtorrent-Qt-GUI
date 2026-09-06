@@ -41,7 +41,8 @@ from PyQt6.QtWidgets import (
     QMessageBox, QSpinBox, QDialog, QDialogButtonBox, QLabel, QComboBox,
     QMenu, QStatusBar, QAbstractItemView, QCheckBox, QFileDialog,
     QSystemTrayIcon, QStyle, QTableView, QTabWidget, QListWidget,
-    QListWidgetItem, QPlainTextEdit, QSplitter, QToolButton, QDoubleSpinBox
+    QListWidgetItem, QPlainTextEdit, QSplitter, QToolButton, QDoubleSpinBox,
+    QRadioButton, QButtonGroup
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QProcess, QProcessEnvironment, QEvent,
@@ -90,6 +91,7 @@ DEFAULT_CONFIG = {
     # SSH connection used for rtorrent RPC (see AutomationDialog).
     "autograb_config_path": "~/.config/rtorrent-autograb/config.json",
     "autograb_log_path": "~/.config/rtorrent-autograb/activity.json",
+    "autograb_state_path": "~/.config/rtorrent-autograb/seen.json",
 }
 
 
@@ -853,6 +855,8 @@ class SettingsDialog(QDialog):
         self.autograb_config_edit.setPlaceholderText("~/.config/rtorrent-autograb/config.json")
         self.autograb_log_edit = QLineEdit(cfg.get("autograb_log_path", ""))
         self.autograb_log_edit.setPlaceholderText("~/.config/rtorrent-autograb/activity.json")
+        self.autograb_state_edit = QLineEdit(cfg.get("autograb_state_path", ""))
+        self.autograb_state_edit.setPlaceholderText("~/.config/rtorrent-autograb/seen.json")
 
         form = QFormLayout()
         form.addRow("RPC transport:", self.mode_combo)
@@ -879,6 +883,7 @@ class SettingsDialog(QDialog):
                             " it runs no web server of its own)</b>"))
         form.addRow("Remote config path:", self.autograb_config_edit)
         form.addRow("Remote activity log path:", self.autograb_log_edit)
+        form.addRow("Remote dedupe/state path:", self.autograb_state_edit)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -925,6 +930,7 @@ class SettingsDialog(QDialog):
         cfg["download_dir"] = self.download_dir_edit.text().strip()
         cfg["autograb_config_path"] = self.autograb_config_edit.text().strip()
         cfg["autograb_log_path"] = self.autograb_log_edit.text().strip()
+        cfg["autograb_state_path"] = self.autograb_state_edit.text().strip()
 
         new_password = self.password_edit.text()
         if self._forget_password and not new_password:
@@ -1331,6 +1337,29 @@ class RemoteConfigClient:
             return []
         return list(entries[-limit:][::-1])
 
+    def _write_json(self, remote_path, obj):
+        if not remote_path:
+            raise RemoteConfigError("No remote path configured for this (see Settings).")
+        data = json.dumps(obj).encode("utf-8")
+        quoted = _quote_remote_path(remote_path)
+        tmp_quoted = _quote_remote_path(remote_path + ".tmp")
+        result = self._run(f"cat > {tmp_quoted} && mv -- {tmp_quoted} {quoted}", input_bytes=data)
+        if result.returncode != 0:
+            raise RemoteConfigError(
+                result.stderr.decode("utf-8", "replace").strip() or f"Failed to write {remote_path} on server."
+            )
+
+    def clear_log(self, remote_path):
+        """Empties the activity log file. The running daemon notices this
+        on its own (it watches the file's mtime) and won't resurrect the
+        old entries on its next write."""
+        self._write_json(remote_path, {"entries": []})
+
+    def clear_state(self, remote_path):
+        """Empties the dedupe store. Also picked up automatically by a
+        running daemon -- see the mtime-check comment in SeenStore."""
+        self._write_json(remote_path, {"seen": []})
+
 
 DEFAULT_FILTER = {
     "name": "New filter", "enabled": True, "include_keywords": [], "include_mode": "any",
@@ -1439,16 +1468,24 @@ class FilterEditorDialog(QDialog):
 
         self.include_edit = QLineEdit(_list_to_csv(f["include_keywords"]))
         self.include_edit.setPlaceholderText("e.g. bike, car")
-        self.include_mode_combo = QComboBox()
-        # Item text spells out the example concretely, since "any" / "all"
-        # alone is exactly the kind of thing that's ambiguous until you've
-        # seen it applied to your own words.
-        self.include_mode_combo.addItem(
-            "Match ANY of these (OR) — \u201cbike, car\u201d adds releases with either word", "any")
-        self.include_mode_combo.addItem(
-            "Match ALL of these (AND) — \u201cbike, car\u201d only adds releases with both words", "all")
-        include_mode_idx = self.include_mode_combo.findData(f.get("include_mode", "any"))
-        self.include_mode_combo.setCurrentIndex(max(include_mode_idx, 0))
+        self.include_mode_or_radio = QRadioButton("OR (any word)")
+        self.include_mode_or_radio.setToolTip('"bike, car" adds releases with either word')
+        self.include_mode_and_radio = QRadioButton("AND (all words)")
+        self.include_mode_and_radio.setToolTip('"bike, car" only adds releases containing both words')
+        self.include_mode_group = QButtonGroup(self)
+        self.include_mode_group.addButton(self.include_mode_or_radio)
+        self.include_mode_group.addButton(self.include_mode_and_radio)
+        if f.get("include_mode", "any") == "all":
+            self.include_mode_and_radio.setChecked(True)
+        else:
+            self.include_mode_or_radio.setChecked(True)
+        include_mode_row = QHBoxLayout()
+        include_mode_row.setContentsMargins(0, 0, 0, 0)
+        include_mode_row.addWidget(self.include_mode_or_radio)
+        include_mode_row.addWidget(self.include_mode_and_radio)
+        include_mode_row.addStretch()
+        include_mode_row_w = QWidget()
+        include_mode_row_w.setLayout(include_mode_row)
 
         self.exclude_edit = QLineEdit(_list_to_csv(f["exclude_keywords"]))
         self.exclude_edit.setPlaceholderText("e.g. cam, telesync")
@@ -1479,11 +1516,10 @@ class FilterEditorDialog(QDialog):
         form.addRow("Name:", self.name_edit)
         form.addRow("", self.enabled_check)
         form.addRow("Include keywords:", self.include_edit)
-        form.addRow("Match mode:", self.include_mode_combo)
+        form.addRow("Match mode:", include_mode_row_w)
         form.addRow("", self._hint(
-            "Comma-separated words or phrases. Leave blank to skip this check entirely "
-            "(everything passes). With multiple words, \u201cMatch mode\u201d above decides "
-            "whether ONE of them is enough (OR) or the release must contain EVERY one (AND)."
+            "Comma-separated words or phrases. Leave blank to skip this check (everything "
+            "passes). OR = one is enough; AND = the release must contain every one."
         ))
         form.addRow("Exclude keywords:", self.exclude_edit)
         form.addRow("", self._hint(
@@ -1548,7 +1584,7 @@ class FilterEditorDialog(QDialog):
             "name": self.name_edit.text().strip() or "Unnamed filter",
             "enabled": self.enabled_check.isChecked(),
             "include_keywords": _csv_to_list(self.include_edit.text()),
-            "include_mode": self.include_mode_combo.currentData() or "any",
+            "include_mode": "all" if self.include_mode_and_radio.isChecked() else "any",
             "exclude_keywords": _csv_to_list(self.exclude_edit.text()),
             "regex": self.regex_edit.text().strip(),
             "quality": _csv_to_list(self.quality_edit.text()),
@@ -1753,13 +1789,14 @@ class AutomationDialog(QDialog):
     filters by reading/writing its config file over SSH (the daemon runs no
     web server), plus a read-only recent-activity log read the same way."""
 
-    def __init__(self, parent, client: RemoteConfigClient, config_path: str, log_path: str):
+    def __init__(self, parent, client: RemoteConfigClient, config_path: str, log_path: str, state_path: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Automation — IRC & RSS auto-add")
         self.resize(720, 520)
         self.client = client
         self.config_path = config_path
         self.log_path = log_path
+        self.state_path = state_path
         self.cfg = None  # loaded lazily
 
         self.status_label = QLabel("")
@@ -1791,10 +1828,16 @@ class AutomationDialog(QDialog):
         self.log_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         log_refresh_btn = QPushButton("Refresh log")
         log_refresh_btn.clicked.connect(self.refresh_log)
+        log_clear_btn = QPushButton("Clear log")
+        log_clear_btn.clicked.connect(self.clear_log)
         log_tab = QWidget()
         log_layout = QVBoxLayout(log_tab)
         log_layout.addWidget(self.log_table)
-        log_layout.addWidget(log_refresh_btn)
+        log_btn_row = QHBoxLayout()
+        log_btn_row.addWidget(log_refresh_btn)
+        log_btn_row.addWidget(log_clear_btn)
+        log_btn_row.addStretch()
+        log_layout.addLayout(log_btn_row)
 
         tabs = QTabWidget()
         tabs.addTab(irc_tab, "IRC Sources")
@@ -1805,10 +1848,18 @@ class AutomationDialog(QDialog):
         reload_btn.clicked.connect(self.load_config)
         save_btn = QPushButton("Save to server")
         save_btn.clicked.connect(self.save_config)
+        reset_dedupe_btn = QPushButton("Reset dedupe...")
+        reset_dedupe_btn.setToolTip(
+            "Clears the \"already grabbed\" memory for every source, so anything "
+            "still present in a feed gets looked at fresh next poll. Use this "
+            "after loosening filters and nothing new is coming through."
+        )
+        reset_dedupe_btn.clicked.connect(self.reset_dedupe)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
         btn_row = QHBoxLayout()
         btn_row.addWidget(reload_btn)
+        btn_row.addWidget(reset_dedupe_btn)
         btn_row.addStretch()
         btn_row.addWidget(save_btn)
         btn_row.addWidget(close_btn)
@@ -1876,6 +1927,45 @@ class AutomationDialog(QDialog):
             self.log_table.setItem(row, 2, QTableWidgetItem(e.get("name", "")))
             self.log_table.setItem(row, 3, QTableWidgetItem(e.get("status", "")))
             self.log_table.setItem(row, 4, QTableWidgetItem(e.get("detail", "")))
+
+    def clear_log(self):
+        if QMessageBox.question(
+            self, "Clear activity log",
+            "Clear the activity log on the server? This can't be undone.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.client.clear_log(self.log_path)
+            self.status_label.setText("Activity log cleared.")
+            self.refresh_log()
+        except RemoteConfigError as e:
+            QMessageBox.warning(self, "Clear failed", str(e))
+
+    def reset_dedupe(self):
+        if not self.state_path:
+            QMessageBox.information(
+                self, "Not configured",
+                "Set the remote dedupe/state path in Settings first (the daemon's "
+                "--init prints it, default: ~/.config/rtorrent-autograb/seen.json)."
+            )
+            return
+        if QMessageBox.question(
+            self, "Reset dedupe",
+            "Clear the \"already grabbed\" memory for every IRC/RSS source? "
+            "Anything still present in a feed will be looked at again on the "
+            "next poll -- if it was actually added before, it may be added "
+            "again (rtorrent itself will just report it as a duplicate hash, "
+            "not create a second copy).",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.client.clear_state(self.state_path)
+            self.status_label.setText(
+                "Dedupe store cleared. The running daemon picks this up on its own "
+                "(it watches the file), no restart needed."
+            )
+        except RemoteConfigError as e:
+            QMessageBox.warning(self, "Reset failed", str(e))
 
     # -- IRC sources -------------------------------------------------------
 
@@ -2267,6 +2357,7 @@ class MainWindow(QMainWindow):
             self, client,
             self.cfg.get("autograb_config_path", ""),
             self.cfg.get("autograb_log_path", ""),
+            self.cfg.get("autograb_state_path", ""),
         )
         dlg.exec()
 

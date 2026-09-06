@@ -283,6 +283,13 @@ class GrabLog:
         self.cap = cap
         self._lock = threading.RLock()
         self._entries = self._load()
+        self._mtime = self._stat_mtime()
+
+    def _stat_mtime(self):
+        try:
+            return self.path.stat().st_mtime
+        except OSError:
+            return None
 
     def _load(self):
         if self.path.exists():
@@ -294,15 +301,28 @@ class GrabLog:
                 pass
         return []
 
+    def _reload_if_changed_externally_locked(self):
+        """If something outside this process rewrote the file since we last
+        touched it -- e.g. the GUI's "Clear log" button writing an empty
+        file over SSH -- reload from disk instead of blindly appending to
+        our in-memory copy, which would otherwise silently resurrect
+        everything the external write just cleared on the very next add()."""
+        current = self._stat_mtime()
+        if current != self._mtime:
+            self._entries = self._load()
+            self._mtime = current
+
     def _save_locked(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         with open(tmp, "w") as f:
             json.dump({"entries": self._entries}, f, indent=2)
         tmp.replace(self.path)
+        self._mtime = self._stat_mtime()
 
     def add(self, source_type, source_name, name, status, detail=""):
         with self._lock:
+            self._reload_if_changed_externally_locked()
             self._entries.append({
                 "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "source_type": source_type,
@@ -338,6 +358,13 @@ class SeenStore:
         self._seen = []          # ordered list, oldest first, for eviction
         self._seen_set = set()
         self._load()
+        self._mtime = self._stat_mtime()
+
+    def _stat_mtime(self):
+        try:
+            return self.path.stat().st_mtime
+        except OSError:
+            return None
 
     def _load(self):
         if self.path.exists():
@@ -349,15 +376,29 @@ class SeenStore:
             except (json.JSONDecodeError, OSError):
                 pass
 
+    def _reload_if_changed_externally_locked(self):
+        """Same idea as GrabLog's: pick up an external rewrite (e.g. the
+        GUI's "Reset dedupe" button clearing this file over SSH) instead of
+        only ever seeing our own in-memory copy, which would otherwise
+        ignore the reset until the whole process restarts."""
+        current = self._stat_mtime()
+        if current != self._mtime:
+            self._seen = []
+            self._seen_set = set()
+            self._load()
+            self._mtime = current
+
     def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         with open(tmp, "w") as f:
             json.dump({"seen": self._seen}, f)
         tmp.replace(self.path)
+        self._mtime = self._stat_mtime()
 
     def has(self, key):
         with self._lock:
+            self._reload_if_changed_externally_locked()
             return key in self._seen_set
 
     def mark(self, key):
@@ -366,6 +407,7 @@ class SeenStore:
         Watcher.handle_candidate for why filtered-out items must NOT be
         marked seen here."""
         with self._lock:
+            self._reload_if_changed_externally_locked()
             if key in self._seen_set:
                 return
             self._seen.append(key)
@@ -693,43 +735,40 @@ class Watcher(threading.Thread):
         source_name = self.source.get("name", self.source.get("id", "?"))
         filters = self.source.get("filters") or []
 
-        if not filters:
-            # A source with zero filters can never match anything -- this is
-            # the single most common reason "I added a feed/channel and
-            # nothing came through": there's no catch-all filter yet. (A
-            # filter with every field left blank matches everything, if
-            # that's what's wanted.)
-            grab_log.add(
-                self.source_type, source_name, name, "filtered_out",
-                detail="this source has no filters configured, so nothing can ever match -- "
-                       "add at least one filter (leave all fields blank to match everything)",
-            )
-            return
+        if filters:
+            filt, reasons = first_matching_filter_verbose(name, size_bytes, filters)
+            if filt is None:
+                detail = "; ".join(f"{fname}: {reason}" for fname, reason in reasons)
+                grab_log.add(self.source_type, source_name, name, "filtered_out", detail=detail)
+                return
+            matched_filter_name = filt.get("name")
+            download_dir = filt.get("download_dir") or rt_cfg.get("download_dir") or ""
+        else:
+            # No filters configured on this source at all means no
+            # restrictions -- grab everything it sees. If you don't want a
+            # source grabbing anything, disable the source itself; there's
+            # no separate "on, but blocks everything" state.
+            matched_filter_name = "(no filters configured -- grabbing everything)"
+            download_dir = rt_cfg.get("download_dir") or ""
 
-        filt, reasons = first_matching_filter_verbose(name, size_bytes, filters)
-        if filt is None:
-            detail = "; ".join(f"{fname}: {reason}" for fname, reason in reasons)
-            grab_log.add(self.source_type, source_name, name, "filtered_out", detail=detail)
-            return
-
-        # Dedupe is only checked/recorded once something actually matched a
-        # filter, and only marked seen after a successful add below. If this
-        # ran before the filter check, an item that was merely rejected once
-        # would stay "seen" forever -- so loosening the filter later (e.g.
-        # while tuning it) could never pick that item back up even though it
-        # never actually got added.
+        # Dedupe is only checked/recorded once something actually matched
+        # (or, with no filters, would unconditionally match), and only
+        # marked seen after a successful add below. If this ran before the
+        # filter check, an item that was merely rejected once would stay
+        # "seen" forever -- so loosening the filter later (e.g. while tuning
+        # it) could never pick that item back up even though it never
+        # actually got added.
         if dedupe_key is not None and self.seen.has(dedupe_key):
             grab_log.add(self.source_type, source_name, name, "duplicate")
             return
 
-        download_dir = filt.get("download_dir") or rt_cfg.get("download_dir") or ""
         try:
             rpc = make_rpc(rt_cfg)
             add_to_rtorrent(rpc, url, download_dir, user_agent)
             if dedupe_key is not None:
                 self.seen.mark(dedupe_key)
-            grab_log.add(self.source_type, source_name, name, "added", detail=f"matched filter '{filt.get('name')}'")
-            log.info("[%s] Added: %s (filter: %s)", source_name, name, filt.get("name"))
+            grab_log.add(self.source_type, source_name, name, "added", detail=f"matched filter '{matched_filter_name}'")
+            log.info("[%s] Added: %s (filter: %s)", source_name, name, matched_filter_name)
         except Exception as e:
             grab_log.add(self.source_type, source_name, name, "error", detail=str(e))
             log.error("[%s] Failed to add '%s': %s", source_name, name, e)
@@ -952,11 +991,20 @@ class SourceManager(threading.Thread):
                 continue
             kind, _id = key
             log.info("Starting %s watcher: %s", kind, source.get("name"))
-            if not any(f.get("enabled", True) for f in source.get("filters") or []):
+            filters = source.get("filters") or []
+            if not filters:
+                log.info(
+                    "%s source '%s' has no filters configured -- it will grab EVERYTHING "
+                    "it sees, with no restrictions. Add a filter if you want to narrow "
+                    "that down; disable the source instead if you want it to grab nothing.",
+                    kind.upper(), source.get("name"),
+                )
+            elif not any(f.get("enabled", True) for f in filters):
                 log.warning(
-                    "%s source '%s' has no enabled filters -- nothing will ever be added "
-                    "from it. Add at least one filter (a filter with every field left blank "
-                    "matches everything).", kind.upper(), source.get("name"),
+                    "%s source '%s' has filters, but all of them are disabled -- this "
+                    "blocks everything (unlike having no filters at all, which grabs "
+                    "everything). Enable at least one, or remove them all.",
+                    kind.upper(), source.get("name"),
                 )
             cls = IrcWatcher if kind == "irc" else RssWatcher
             w = cls(source, self.cfg_store, self.seen)
