@@ -1355,6 +1355,17 @@ def _list_to_csv(items):
     return ", ".join(items or [])
 
 
+def _keyword_present(lname: str, keyword: str) -> bool:
+    """Same token-boundary matcher as rtorrent_autograb.py's: a keyword only
+    counts as present if it isn't glued to other letters/digits on either
+    side, so e.g. excluding "ts" (telesync) doesn't also reject "YTS"."""
+    pattern = r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])"
+    try:
+        return re.search(pattern, lname) is not None
+    except re.error:
+        return keyword in lname
+
+
 def filter_matches(name: str, size_bytes, filt: dict):
     """Local port of rtorrent_autograb.py's filter_matches(), used only for
     the "Test..." preview button below -- no network round-trip needed."""
@@ -1364,13 +1375,13 @@ def filter_matches(name: str, size_bytes, filt: dict):
     include = [k.lower() for k in filt.get("include_keywords", []) if k and k.strip()]
     if include:
         if filt.get("include_mode", "any") == "all":
-            if not all(k in lname for k in include):
+            if not all(_keyword_present(lname, k) for k in include):
                 return False
         else:
-            if not any(k in lname for k in include):
+            if not any(_keyword_present(lname, k) for k in include):
                 return False
     exclude = [k.lower() for k in filt.get("exclude_keywords", []) if k and k.strip()]
-    if any(k in lname for k in exclude):
+    if any(_keyword_present(lname, k) for k in exclude):
         return False
     regex = (filt.get("regex") or "").strip()
     if regex:
@@ -1380,10 +1391,10 @@ def filter_matches(name: str, size_bytes, filt: dict):
         except re.error:
             return False
     quality = [q.lower() for q in filt.get("quality", []) if q and q.strip()]
-    if quality and not any(q in lname for q in quality):
+    if quality and not any(_keyword_present(lname, q) for q in quality):
         return False
     codecs = [c.lower() for c in filt.get("codecs", []) if c and c.strip()]
-    if codecs and not any(c in lname for c in codecs):
+    if codecs and not any(_keyword_present(lname, c) for c in codecs):
         return False
     if size_bytes is not None:
         size_mb = size_bytes / (1024 * 1024)

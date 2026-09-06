@@ -381,6 +381,22 @@ class SeenStore:
 # Filter matching
 # --------------------------------------------------------------------------
 
+def _keyword_present(lname: str, keyword: str) -> bool:
+    """True if `keyword` appears in `lname` as a standalone token, not glued
+    to other letters/digits on either side. Release names delimit real tags
+    with dots/dashes/underscores/spaces/brackets ("Movie.2026.TS.x264"), so
+    this is what makes an exclude keyword like "ts" (telesync) correctly
+    leave "YTS" alone -- a plain substring check would match the "ts" inside
+    "YTS" too, since "y" isn't a boundary character. Falls back to a plain
+    substring check only if the keyword can't be turned into a valid regex
+    (shouldn't happen, since it's escaped first)."""
+    pattern = r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])"
+    try:
+        return re.search(pattern, lname) is not None
+    except re.error:
+        return keyword in lname
+
+
 def filter_matches_verbose(name: str, size_bytes, filt: dict):
     """Same checks as filter_matches(), but also returns a human-readable
     reason for the result -- this is what makes "why didn't this get
@@ -393,15 +409,15 @@ def filter_matches_verbose(name: str, size_bytes, filt: dict):
     if include:
         mode = filt.get("include_mode", "any")
         if mode == "all":
-            missing = [k for k in include if k not in lname]
+            missing = [k for k in include if not _keyword_present(lname, k)]
             if missing:
                 return False, f"missing required keyword(s): {', '.join(missing)}"
         else:
-            if not any(k in lname for k in include):
+            if not any(_keyword_present(lname, k) for k in include):
                 return False, f"name doesn't contain any of: {', '.join(include)}"
 
     exclude = [k.lower() for k in filt.get("exclude_keywords", []) if k and k.strip()]
-    hit = next((k for k in exclude if k in lname), None)
+    hit = next((k for k in exclude if _keyword_present(lname, k)), None)
     if hit:
         return False, f"excluded by keyword: {hit}"
 
@@ -415,11 +431,11 @@ def filter_matches_verbose(name: str, size_bytes, filt: dict):
             return False, f"filter's regex is invalid: {e}"
 
     quality = [q.lower() for q in filt.get("quality", []) if q and q.strip()]
-    if quality and not any(q in lname for q in quality):
+    if quality and not any(_keyword_present(lname, q) for q in quality):
         return False, f"no matching quality tag (wanted one of: {', '.join(quality)})"
 
     codecs = [c.lower() for c in filt.get("codecs", []) if c and c.strip()]
-    if codecs and not any(c in lname for c in codecs):
+    if codecs and not any(_keyword_present(lname, c) for c in codecs):
         return False, f"no matching codec tag (wanted one of: {', '.join(codecs)})"
 
     if size_bytes is not None:
