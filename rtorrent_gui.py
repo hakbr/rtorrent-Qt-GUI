@@ -1366,45 +1366,53 @@ def _keyword_present(lname: str, keyword: str) -> bool:
         return keyword in lname
 
 
-def filter_matches(name: str, size_bytes, filt: dict):
-    """Local port of rtorrent_autograb.py's filter_matches(), used only for
-    the "Test..." preview button below -- no network round-trip needed."""
+def filter_matches_verbose(name: str, size_bytes, filt: dict):
+    """Local port of rtorrent_autograb.py's filter_matches_verbose(), used
+    by the "Test..." preview button to show exactly why a sample name would
+    or wouldn't be grabbed -- same reason text you'd see in the server's
+    Activity Log."""
     if not filt.get("enabled", True):
-        return False
+        return False, "filter is disabled"
     lname = name.lower()
     include = [k.lower() for k in filt.get("include_keywords", []) if k and k.strip()]
     if include:
         if filt.get("include_mode", "any") == "all":
-            if not all(_keyword_present(lname, k) for k in include):
-                return False
+            missing = [k for k in include if not _keyword_present(lname, k)]
+            if missing:
+                return False, f"missing required keyword(s): {', '.join(missing)}"
         else:
             if not any(_keyword_present(lname, k) for k in include):
-                return False
+                return False, f"name doesn't contain any of: {', '.join(include)}"
     exclude = [k.lower() for k in filt.get("exclude_keywords", []) if k and k.strip()]
-    if any(_keyword_present(lname, k) for k in exclude):
-        return False
+    hit = next((k for k in exclude if _keyword_present(lname, k)), None)
+    if hit:
+        return False, f"excluded by keyword: {hit}"
     regex = (filt.get("regex") or "").strip()
     if regex:
         try:
             if not re.search(regex, name, re.IGNORECASE):
-                return False
-        except re.error:
-            return False
+                return False, f"didn't match regex: {regex}"
+        except re.error as e:
+            return False, f"filter's regex is invalid: {e}"
     quality = [q.lower() for q in filt.get("quality", []) if q and q.strip()]
     if quality and not any(_keyword_present(lname, q) for q in quality):
-        return False
+        return False, f"no matching quality tag (wanted one of: {', '.join(quality)})"
     codecs = [c.lower() for c in filt.get("codecs", []) if c and c.strip()]
     if codecs and not any(_keyword_present(lname, c) for c in codecs):
-        return False
+        return False, f"no matching codec tag (wanted one of: {', '.join(codecs)})"
     if size_bytes is not None:
         size_mb = size_bytes / (1024 * 1024)
         min_mb = filt.get("min_size_mb") or 0
         max_mb = filt.get("max_size_mb") or 0
         if min_mb and size_mb < min_mb:
-            return False
+            return False, f"size {size_mb:.0f}MB is below the {min_mb}MB minimum"
         if max_mb and size_mb > max_mb:
-            return False
-    return True
+            return False, f"size {size_mb:.0f}MB is above the {max_mb}MB maximum"
+    return True, "matched"
+
+
+def filter_matches(name: str, size_bytes, filt: dict):
+    return filter_matches_verbose(name, size_bytes, filt)[0]
 
 
 class FilterEditorDialog(QDialog):
@@ -1495,11 +1503,17 @@ class FilterEditorDialog(QDialog):
 
         self.test_name_edit = QLineEdit()
         self.test_name_edit.setPlaceholderText("Paste a sample release name to test this filter against...")
+        self.test_size_spin = QSpinBox()
+        self.test_size_spin.setRange(0, 999999)
+        self.test_size_spin.setSuffix(" MB")
+        self.test_size_spin.setSpecialValueText("Size unknown")
         self.test_result_label = QLabel("")
+        self.test_result_label.setWordWrap(True)
         test_btn = QPushButton("Test")
         test_btn.clicked.connect(self.run_test)
         test_row = QHBoxLayout()
         test_row.addWidget(self.test_name_edit, 1)
+        test_row.addWidget(self.test_size_spin)
         test_row.addWidget(test_btn)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -1509,6 +1523,11 @@ class FilterEditorDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(QLabel("<b>Test</b> (checked locally, doesn't touch the server)"))
         layout.addLayout(test_row)
+        layout.addWidget(self._hint(
+            "Leave size at \u201cSize unknown\u201d to skip the min/max size check (like IRC "
+            "announcements, which rarely carry a size) — set it to test against your Min/Max "
+            "size fields the way an RSS item with a known size would be checked."
+        ))
         layout.addWidget(self.test_result_label)
         layout.addWidget(buttons)
 
@@ -1517,11 +1536,12 @@ class FilterEditorDialog(QDialog):
         if not name:
             self.test_result_label.setText("")
             return
-        matches = filter_matches(name, None, self.get_filter())
+        size_bytes = self.test_size_spin.value() * 1024 * 1024 if self.test_size_spin.value() else None
+        matches, reason = filter_matches_verbose(name, size_bytes, self.get_filter())
         if matches:
-            self.test_result_label.setText("✓ Matches (size range is skipped in this preview)")
+            self.test_result_label.setText("✓ Matches")
         else:
-            self.test_result_label.setText("✗ Does not match")
+            self.test_result_label.setText(f"✗ Does not match — {reason}")
 
     def get_filter(self):
         return {

@@ -376,6 +376,17 @@ class SeenStore:
                 self._seen_set.difference_update(drop)
             self._save()
 
+    def clear(self):
+        """Wipes the dedupe store. Needed after upgrading from a version
+        that had the old "mark seen before checking filters" bug: anything
+        that was merely looked-at-and-rejected under that bug is stuck
+        marked seen forever, and no amount of loosening filters afterward
+        will bring it back without clearing this."""
+        with self._lock:
+            self._seen = []
+            self._seen_set = set()
+            self._save()
+
 
 # --------------------------------------------------------------------------
 # Filter matching
@@ -872,6 +883,19 @@ class RssWatcher(Watcher):
         with urlopen(req, timeout=30) as resp:
             raw = resp.read()
         items = parse_feed(raw)
+        # Always logged (not just on error), because a feed returning zero
+        # items -- wrong URL, an auth wall serving an HTML error page instead
+        # of RSS, an empty category -- would otherwise be silent: nothing
+        # reaches the activity log if there was nothing to filter in the
+        # first place, which looks identical to "everything got rejected"
+        # from the GUI's point of view.
+        log.info("[rss:%s] polled feed: %d item(s) found", src.get("name"), len(items))
+        if not items:
+            log.warning(
+                "[rss:%s] feed returned 0 items -- check the URL is correct and reachable "
+                "from the server (wget/curl it there), and that it doesn't require auth "
+                "this request isn't sending.", src.get("name"),
+            )
         for item in items:
             dedupe_key = "rss:" + hashlib.sha1((src["id"] + "|" + item["guid"]).encode("utf-8", "replace")).hexdigest()
             self.handle_candidate(dedupe_key, item["title"] or item["url"], item["url"], item["size_bytes"])
@@ -975,6 +999,10 @@ def cmd_run(args):
 
     cfg_store = ConfigStore(args.config)
     seen = SeenStore(args.state, cap=cfg_store.get().get("dedupe_max", 5000))
+    if args.reset_state:
+        seen.clear()
+        log.info("Dedupe store cleared (--reset-state) -- previously-rejected items "
+                 "still present in a feed's window will be reconsidered on the next poll.")
 
     rt_cfg = cfg_store.get()["rtorrent"]
     try:
@@ -1012,6 +1040,11 @@ def build_arg_parser():
                     help="Path to the activity/grab log JSON (default: activity.json next to --config)")
     p.add_argument("--verbose", action="store_true", help="Debug logging")
     p.add_argument("--init", action="store_true", help="Write a fresh config file, print its path, then exit")
+    p.add_argument("--reset-state", action="store_true",
+                    help="Clear the dedupe store on startup, so previously-rejected items "
+                         "still present in a feed get a fresh look (useful right after "
+                         "loosening filters, or after upgrading from a version with the "
+                         "old mark-seen-before-filtering behavior)")
     return p
 
 
